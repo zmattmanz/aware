@@ -728,35 +728,31 @@ void setup() {
   drone::begin();  // BLE Remote ID scan + surveil ingest run continuously from here on
 }
 
-static void animateFlip(int newRot) {
-  M5Canvas fb(&M5.Display);                 // off-screen buffer => flicker-free
-  fb.setColorDepth(16);
-  bool ok = fb.createSprite(W, H);          // ~63 KB; falls back if it can't alloc
+static void animateCardFlip(int newRot) {
+  const float cx = W / 2.0f, cy = H / 2.0f;
+  const int   half = 7;        // frames per phase (~14 total)
+  const float zmin = 0.03f;    // how thin the "edge-on" line gets
   cv.setPivot(W / 2.0f, H / 2.0f);
 
-  const int steps = 14;                     // ~14 frames * ~14 ms ≈ 200 ms
-  for (int i = 1; i <= steps; ++i) {
-    float t   = (float)i / steps;
-    float e   = t * t * (3.0f - 2.0f * t); // smoothstep ease-in-out
-    float ang = 180.0f * e;
-    float rad = ang * 0.017453293f;
-    // shrink so the rotated frame always fits the 240x135 panel mid-spin
-    float bw  = W * fabsf(cosf(rad)) + H * fabsf(sinf(rad));
-    float bh  = W * fabsf(sinf(rad)) + H * fabsf(cosf(rad));
-    float z   = fminf(fminf((float)W / bw, (float)H / bh), 1.0f);
-
-    if (ok) {
-      fb.fillScreen(COL_BG);
-      fb.setPivot(W / 2.0f, H / 2.0f);
-      cv.pushRotateZoom(&fb, W / 2.0f, H / 2.0f, ang, z, z);
-      fb.pushSprite(0, 0);
-    } else {
-      M5.Display.fillScreen(COL_BG);
-      cv.pushRotateZoom(W / 2.0f, H / 2.0f, ang, z, z);
+  auto frame = [&](float angle, float zx) {
+    int bandHalf = (int)ceilf(W * zx * 0.5f) + 1;
+    M5.Display.startWrite();
+    if (bandHalf < (int)cx) {
+      M5.Display.fillRect(0, 0, (int)cx - bandHalf, H, COL_BG);
+      M5.Display.fillRect((int)cx + bandHalf, 0, W - ((int)cx + bandHalf), H, COL_BG);
     }
-    delay(14);
+    cv.pushRotateZoom(cx, cy, angle, zx, 1.0f);
+    M5.Display.endWrite();
+  };
+
+  for (int i = 1; i <= half; ++i) {        // squash current view to a line
+    float t = (float)i / half;
+    frame(0.0f, 1.0f - (1.0f - zmin) * (t * t));        // ease-in
   }
-  if (ok) fb.deleteSprite();
+  for (int i = 0; i <= half; ++i) {        // grow the flipped view back out
+    float t = (float)i / half;
+    frame(180.0f, zmin + (1.0f - zmin) * (t * (2.0f - t)));  // ease-out
+  }
 
   M5.Display.setRotation(newRot);
   render();
@@ -820,7 +816,7 @@ void loop() {
     if (fabsf(h) > 0.5f) {                           // only when clearly landscape
       static int rot = 1;
       int want = (h > 0) ? 1 : 3;                    // swap 1 and 3 if screen ends up upside-down
-      if (want != rot) { rot = want; animateFlip(rot); }
+      if (want != rot) { rot = want; animateCardFlip(rot); }
     }
     float mag = sqrtf(ax*ax + ay*ay + az*az);
     if (fabsf(mag - last_mag) > 0.06f) last_motion = now;
