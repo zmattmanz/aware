@@ -728,6 +728,40 @@ void setup() {
   drone::begin();  // BLE Remote ID scan + surveil ingest run continuously from here on
 }
 
+static void animateFlip(int newRot) {
+  M5Canvas fb(&M5.Display);                 // off-screen buffer => flicker-free
+  fb.setColorDepth(16);
+  bool ok = fb.createSprite(W, H);          // ~63 KB; falls back if it can't alloc
+  cv.setPivot(W / 2.0f, H / 2.0f);
+
+  const int steps = 14;                     // ~14 frames * ~14 ms ≈ 200 ms
+  for (int i = 1; i <= steps; ++i) {
+    float t   = (float)i / steps;
+    float e   = t * t * (3.0f - 2.0f * t); // smoothstep ease-in-out
+    float ang = 180.0f * e;
+    float rad = ang * 0.017453293f;
+    // shrink so the rotated frame always fits the 240x135 panel mid-spin
+    float bw  = W * fabsf(cosf(rad)) + H * fabsf(sinf(rad));
+    float bh  = W * fabsf(sinf(rad)) + H * fabsf(cosf(rad));
+    float z   = fminf(fminf((float)W / bw, (float)H / bh), 1.0f);
+
+    if (ok) {
+      fb.fillScreen(COL_BG);
+      fb.setPivot(W / 2.0f, H / 2.0f);
+      cv.pushRotateZoom(&fb, W / 2.0f, H / 2.0f, ang, z, z);
+      fb.pushSprite(0, 0);
+    } else {
+      M5.Display.fillScreen(COL_BG);
+      cv.pushRotateZoom(W / 2.0f, H / 2.0f, ang, z, z);
+    }
+    delay(14);
+  }
+  if (ok) fb.deleteSprite();
+
+  M5.Display.setRotation(newRot);
+  render();
+}
+
 void loop() {
   M5.update();
 
@@ -770,13 +804,12 @@ void loop() {
   static unsigned long last_prune = 0;
   if (now - last_prune > 2000) { last_prune = now; drone::prune(); surveil::prune(); }
 
-  // IMU: auto-rotate (low-pass + dominant-axis) + motion-idle tracking (~8 Hz)
+  // IMU: auto-rotate (low-pass + dominant-axis, animated) + motion-idle (~10 Hz)
   static unsigned long last_imu    = 0;
-  static int           imu_rot     = 1;
   static float         gx = 0, gy = 0, gz = 0;  // low-pass gravity estimate
   static float         last_mag    = 1.0f;
   static unsigned long last_motion = 0;
-  if (now - last_imu > 125) {
+  if (now - last_imu > 100) {
     last_imu = now;
     float ax, ay, az;
     M5.Imu.update();
@@ -784,9 +817,10 @@ void loop() {
     const float k = 0.15f;
     gx += k * (ax - gx); gy += k * (ay - gy); gz += k * (az - gz);
     float h = (fabsf(gx) >= fabsf(gy)) ? gx : gy;  // dominant horizontal axis
-    if (fabsf(h) > 0.5f) {                           // only decide when clearly landscape
-      int want = (h > 0) ? 1 : 3;                    // swap 1 and 3 if screen appears upside-down
-      if (want != imu_rot) { imu_rot = want; M5.Display.setRotation(imu_rot); render(); }
+    if (fabsf(h) > 0.5f) {                           // only when clearly landscape
+      static int rot = 1;
+      int want = (h > 0) ? 1 : 3;                    // swap 1 and 3 if screen ends up upside-down
+      if (want != rot) { rot = want; animateFlip(rot); }
     }
     float mag = sqrtf(ax*ax + ay*ay + az*az);
     if (fabsf(mag - last_mag) > 0.06f) last_motion = now;
