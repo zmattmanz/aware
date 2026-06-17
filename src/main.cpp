@@ -185,6 +185,45 @@ static void stopConfigPortal() {
 }
 
 // ---------------------------------------------------------------------------
+// battery helpers
+// ---------------------------------------------------------------------------
+static int battPctFromMv(int mv) {  // approx single-cell Li-ion, resting voltage
+  static const int v[] = {3300,3500,3600,3700,3750,3790,3830,3870,3920,3980,4080,4200};
+  static const int p[] = {   0,   5,  10,  20,  30,  40,  50,  60,  70,  80,  90, 100};
+  if (mv <= v[0]) return 0;
+  for (int i = 1; i < 12; ++i)
+    if (mv <= v[i]) return p[i-1] + (p[i]-p[i-1])*(mv-v[i-1])/(v[i]-v[i-1]);
+  return 100;
+}
+
+// ---------------------------------------------------------------------------
+// BLE vendor lookup — values from Bluetooth SIG Assigned Numbers
+// ---------------------------------------------------------------------------
+struct Vendor { uint16_t cid; const char* name; };
+static const Vendor kVendors[] = {
+  { 0x004C, "Apple"     },   // iPhone/Mac/AirPods/AirTag/Watch — vendor only
+  { 0x0006, "Microsoft" },
+  { 0x00E0, "Google"    },
+  { 0x0075, "Samsung"   },
+  { 0x0059, "Nordic"    },   // dev boards & many BLE gadgets
+};
+static const char* bleVendor(uint16_t cid, bool hasMfr) {
+  if (!hasMfr) return nullptr;
+  for (auto& v : kVendors) if (v.cid == cid) return v.name;
+  return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// brightness arbitration — one place sets brightness; lowest level wins
+// ---------------------------------------------------------------------------
+static void applyBrightness(bool idle, int mv, bool onUsb) {
+  int b = 90;
+  if (idle)                               b = 25;              // motion-idle dim
+  if (!onUsb && mv > 0 && mv < 3300)     b = (b < 40 ? b : 40);  // low-batt cap
+  M5.Display.setBrightness(b);
+}
+
+// ---------------------------------------------------------------------------
 // geo helpers
 // ---------------------------------------------------------------------------
 static inline double deg2rad(double d) { return d * 0.017453292519943295; }
@@ -219,8 +258,8 @@ static void drawTopBar(const char* title) {
   cv.setTextDatum(middle_left);
   cv.drawString(title, 4, TOPBAR_H / 2);
   char b[8] = "";
-  int lvl = M5.Power.getBatteryLevel();
-  if (lvl >= 0) snprintf(b, sizeof(b), "%d%%", lvl);
+  int lvl = battPctFromMv(M5.Power.getBatteryVoltage());
+  snprintf(b, sizeof(b), "%d%%", lvl);
   cv.setTextColor(COL_LABEL, COL_BAR);
   cv.setTextDatum(middle_right);
   cv.drawString(b, W - 14, TOPBAR_H / 2);
@@ -461,8 +500,8 @@ static void drawStatsScreen() {
   cv.drawString(line, 8, y); y += 15;
 
   cv.setTextColor(COL_TEXT, COL_BG);
-  int lvl = M5.Power.getBatteryLevel();
   int mv  = M5.Power.getBatteryVoltage();
+  int lvl = battPctFromMv(mv);
   snprintf(line, sizeof(line), "BATTERY     %d%%", lvl);        cv.drawString(line, 8, y); y += 13;
   snprintf(line, sizeof(line), "VOLTAGE     %.2f V", mv / 1000.0f); cv.drawString(line, 8, y); y += 13;
 
@@ -556,7 +595,9 @@ static void drawScanScreen() {
   for (size_t i = 0; i < nb && nc < kMaxC; ++i) {
     RfContact& c = contacts[nc++];
     c.src = 1;
-    strncpy(c.id, bs[i].name[0] ? bs[i].name : bs[i].mac, sizeof(c.id) - 1);
+    const char* label = bs[i].name[0] ? bs[i].name
+                      : bleVendor(bs[i].company_id, bs[i].has_mfr);
+    strncpy(c.id, label ? label : bs[i].mac, sizeof(c.id) - 1);
     c.id[sizeof(c.id) - 1] = '\0';
     strncpy(c.mac, bs[i].mac, sizeof(c.mac) - 1);
     c.mac[sizeof(c.mac) - 1] = '\0';
@@ -729,15 +770,39 @@ void loop() {
   static unsigned long last_prune = 0;
   if (now - last_prune > 2000) { last_prune = now; drone::prune(); surveil::prune(); }
 
+  // IMU: auto-rotate (low-pass + dominant-axis) + motion-idle tracking (~8 Hz)
+  static unsigned long last_imu    = 0;
+  static int           imu_rot     = 1;
+  static float         gx = 0, gy = 0, gz = 0;  // low-pass gravity estimate
+  static float         last_mag    = 1.0f;
+  static unsigned long last_motion = 0;
+  if (now - last_imu > 125) {
+    last_imu = now;
+    float ax, ay, az;
+    M5.Imu.update();
+    M5.Imu.getAccel(&ax, &ay, &az);
+    const float k = 0.15f;
+    gx += k * (ax - gx); gy += k * (ay - gy); gz += k * (az - gz);
+    float h = (fabsf(gx) >= fabsf(gy)) ? gx : gy;  // dominant horizontal axis
+    if (fabsf(h) > 0.5f) {                           // only decide when clearly landscape
+      int want = (h > 0) ? 1 : 3;                    // swap 1 and 3 if screen appears upside-down
+      if (want != imu_rot) { imu_rot = want; M5.Display.setRotation(imu_rot); render(); }
+    }
+    float mag = sqrtf(ax*ax + ay*ay + az*az);
+    if (fabsf(mag - last_mag) > 0.06f) last_motion = now;
+    last_mag = mag;
+  }
+
   static unsigned long last_batt = 0;
   static int low_reads = 0;
   if (now - last_batt > 5000) {
     last_batt = now;
     int  mv    = M5.Power.getBatteryVoltage();
     bool onUsb = M5.Power.isCharging();
+    bool idle  = (now - last_motion) > 60000UL;
     if (onUsb || mv <= 0) {
       low_reads = 0;
-      M5.Display.setBrightness(90);          // restore on charge / unknown
+      applyBrightness(false, mv, onUsb);     // on charge: restore brightness regardless of idle
     } else if (mv < 3100) {
       if (++low_reads >= 3) {                // ~15 s sustained before sleeping
         cv.fillScreen(COL_BG);
@@ -753,7 +818,7 @@ void loop() {
       }
     } else {
       low_reads = 0;
-      M5.Display.setBrightness(mv < 3300 ? 40 : 90);
+      applyBrightness(idle, mv, onUsb);
     }
   }
 

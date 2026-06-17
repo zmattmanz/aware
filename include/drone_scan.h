@@ -30,8 +30,10 @@ size_t snapshot(Drone* out, size_t max);   // copy active drones under lock -> c
 // for the live RF-scan screen.
 struct BleSight {
   char          mac[18];
-  char          name[20];   // empty if the device advertises no name
+  char          name[20];      // empty if the device advertises no name
   int8_t        rssi;
+  uint16_t      company_id;    // BLE SIG company ID from manufacturer data (0 if none)
+  bool          has_mfr;       // true if the advert carried manufacturer data
   unsigned long last_seen_ms;
 };
 size_t bleSnapshot(BleSight* out, size_t max);  // recent BLE devices -> count

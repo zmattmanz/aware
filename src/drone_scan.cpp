@@ -27,6 +27,8 @@ struct BleEntry {
   char          mac[18];
   char          name[20];
   int8_t        rssi;
+  uint16_t      company_id;
+  bool          has_mfr;
   unsigned long last_seen;
 };
 BleEntry s_ble[kMaxBle];
@@ -71,7 +73,12 @@ class ScanCb : public NimBLEScanCallbacks {
       char m[18];
       std::string ms = dev->getAddress().toString();
       strncpy(m, ms.c_str(), 17); m[17] = '\0';
-      std::string nm = dev->getName();   // passive scan: present only if in the advert itself
+      std::string nm  = dev->getName();   // passive scan: present only if in the advert itself
+      std::string mfr = dev->getManufacturerData();
+      bool hasMfr = mfr.size() >= 2;
+      uint16_t cid = 0;
+      if (hasMfr) cid = (uint16_t)((uint8_t)mfr[0] | ((uint16_t)(uint8_t)mfr[1] << 8));
+
       if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY);
       int hit = -1, fi = -1, oi = 0; unsigned long ot = 0xFFFFFFFFUL;
       for (int i = 0; i < kMaxBle; ++i) {
@@ -83,18 +90,16 @@ class ScanCb : public NimBLEScanCallbacks {
       BleEntry& be = s_ble[bi];
       if (hit < 0) { memset(&be, 0, sizeof(be)); be.used = true; strncpy(be.mac, m, 17); be.mac[17] = '\0'; }
       if (!nm.empty()) { strncpy(be.name, nm.c_str(), sizeof(be.name) - 1); be.name[sizeof(be.name) - 1] = '\0'; }
-      be.rssi = (int8_t)dev->getRSSI();
-      be.last_seen = millis();
+      be.rssi       = (int8_t)dev->getRSSI();
+      be.company_id = cid;
+      be.has_mfr    = hasMfr;
+      be.last_seen  = millis();
       if (s_lock) xSemaphoreGive(s_lock);
 
       // feed surveillance detector (OUI + name + company-ID matching)
       uint8_t mac6[6];
       sscanf(m, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
              &mac6[0], &mac6[1], &mac6[2], &mac6[3], &mac6[4], &mac6[5]);
-      std::string mfr = dev->getManufacturerData();
-      uint16_t cid = 0;
-      bool hasMfr = mfr.size() >= 2;
-      if (hasMfr) cid = (uint16_t)((uint8_t)mfr[0] | ((uint16_t)(uint8_t)mfr[1] << 8));
       surveil::ingestBle(nm.empty() ? nullptr : nm.c_str(), mac6,
                          (int8_t)dev->getRSSI(), cid, hasMfr);
     }
@@ -128,7 +133,7 @@ void begin() {
   s_lock = xSemaphoreCreateMutex();
   NimBLEDevice::init("");
   s_scan = NimBLEDevice::getScan();
-  s_scan->setScanCallbacks(&s_cb, false);
+  s_scan->setScanCallbacks(&s_cb, true);   // report every advert so last_seen refreshes and ODID multi-packet builds up
   s_scan->setActiveScan(false);  // Remote ID lives in the advertisement; no scan-response needed
   s_scan->setInterval(320);      // 0.625 ms units -> 200 ms period
   s_scan->setWindow(60);         // listen 37.5 ms per period (~19% duty cycle)
@@ -189,7 +194,9 @@ size_t bleSnapshot(BleSight* out, size_t max) {
     BleSight& b = out[n];
     strncpy(b.mac, s_ble[i].mac, sizeof(b.mac));
     strncpy(b.name, s_ble[i].name, sizeof(b.name));
-    b.rssi = s_ble[i].rssi;
+    b.rssi         = s_ble[i].rssi;
+    b.company_id   = s_ble[i].company_id;
+    b.has_mfr      = s_ble[i].has_mfr;
     b.last_seen_ms = s_ble[i].last_seen;
     ++n;
   }
