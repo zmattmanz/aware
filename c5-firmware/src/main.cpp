@@ -23,6 +23,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include "esp_wifi.h"
+#include "esp_log.h"
 
 extern "C" {
 #include "odid/opendroneid.h"
@@ -179,6 +180,9 @@ static bool beacon_odid_payload(const uint8_t* f, int len, const uint8_t** out, 
   return false;
 }
 
+// ---- frame counters (incremented in sniffer_cb, reported in loop) ----------
+volatile uint32_t g_n24 = 0, g_n5 = 0;
+
 // ---- promiscuous callback (WiFi task — keep it lean) -----------------------
 static void sniffer_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (type != WIFI_PKT_MGMT) return;
@@ -188,6 +192,7 @@ static void sniffer_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (len < 28) return;
   int8_t rssi = pkt->rx_ctrl.rssi;
   uint8_t band = (pkt->rx_ctrl.channel > 14) ? 2 : 1;
+  if (band == 2) g_n5 += 1; else g_n24 += 1;
 
   uint8_t subtype = (f[0] >> 4) & 0x0F;  // ftype is mgmt (00) here
   ODID_UAS_Data tmp;
@@ -214,12 +219,19 @@ static int g_hop = 0;
 static uint32_t g_last_hop = 0;
 static void hop() {
   static uint8_t cur_band = 0;
+  static uint32_t s_last_diag = 0;
   const Hop& h = kHops[g_hop];
+  esp_err_t eb = ESP_OK, ec;
   if (h.band != cur_band) {
-    esp_wifi_set_band_mode(h.band == 2 ? WIFI_BAND_MODE_5G_ONLY : WIFI_BAND_MODE_2G_ONLY);
+    eb = esp_wifi_set_band_mode(h.band == 2 ? WIFI_BAND_MODE_5G_ONLY : WIFI_BAND_MODE_2G_ONLY);
     cur_band = h.band;
   }
-  esp_wifi_set_channel(h.ch, WIFI_SECOND_CHAN_NONE);
+  ec = esp_wifi_set_channel(h.ch, WIFI_SECOND_CHAN_NONE);
+  if ((eb != ESP_OK || ec != ESP_OK) && millis() - s_last_diag > 2000) {
+    s_last_diag = millis();
+    LinkSerial.printf("D|hop band=%d ch=%d setband=0x%x setch=0x%x\n",
+                      h.band, h.ch, (unsigned)eb, (unsigned)ec);
+  }
   g_hop = (g_hop + 1) % kHopCount;
 }
 
@@ -248,11 +260,14 @@ static void emit(const Slot& s) {
 
 // ---------------------------------------------------------------------------
 void setup() {
+  esp_log_level_set("*", ESP_LOG_NONE);      // nothing rides UART0 but our H|/R|/W| lines
+
   LinkSerial.begin(LINK_BAUD, SERIAL_8N1);  // UART0 pads -> StickS3
   delay(200);
 
   WiFi.mode(WIFI_MODE_NULL);                 // bring up the driver without associating
   esp_wifi_set_ps(WIFI_PS_NONE);
+  esp_wifi_set_country_code("US", true);     // unlock 5 GHz channels (regulatory gate)
   wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
   esp_wifi_set_promiscuous_filter(&filt);
   esp_wifi_set_promiscuous(true);
@@ -295,6 +310,7 @@ void loop() {
   if (now - last_hb >= HEARTBEAT_MS) {
     last_hb = now;
     LinkSerial.printf("H|planewatch-c5|%d\n", PROTOCOL_VERSION);
+    LinkSerial.printf("D|frames 2.4=%lu 5=%lu\n", (unsigned long)g_n24, (unsigned long)g_n5);
   }
 
   // expire slots silent for >30 s

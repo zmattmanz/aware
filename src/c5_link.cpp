@@ -101,6 +101,7 @@ void handleLine(char* line) {
 }  // namespace
 
 void begin() {
+  Link.setRxBufferSize(2048);               // ride out log bursts between polls
   Link.begin(kBaud, SERIAL_8N1, kRxPin, kTxPin);
 #if C5_LINK_DEBUG
   Serial.printf("[c5] link up: Serial1 rx=%d tx=%d @%lu\n",
@@ -109,7 +110,8 @@ void begin() {
 }
 
 void poll() {
-  while (Link.available()) {
+  int budget = 1024;                        // cap bytes per call so a flood can't stall the main loop
+  while (budget-- > 0 && Link.available()) {
     char c = (char)Link.read();
     s_last_byte = millis();
     if (c == '\n' || c == '\r') {
