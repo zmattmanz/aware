@@ -1134,6 +1134,12 @@ static void animateCardFlip(int newRot) {
 void loop() {
   M5.update();
   c5link::poll();  // drain C5 UART every iteration so it never backs up
+  { static unsigned long s_c5diag_t = 0;
+    if (millis() - s_c5diag_t > 1000) {
+      s_c5diag_t = millis();
+      char b[180]; c5link::diag(b, sizeof(b));
+      Serial.printf("[c5diag] %s\n", b);
+    } }
 
   // pump web config portal when active; enforce 3-min timeout
   if (g_portal_active) {

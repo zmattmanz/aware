@@ -19,5 +19,6 @@ struct WifiSight {
   unsigned long last_seen;
 };
 size_t wifiSnapshot(WifiSight* out, size_t max);  // non-stale C5 APs -> count
+void   diag(char* out, size_t n);                 // one-line link status for Serial debug
 
 }  // namespace c5link

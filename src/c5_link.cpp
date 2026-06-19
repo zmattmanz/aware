@@ -30,6 +30,10 @@ size_t          s_len     = 0;
 unsigned long   s_last_hb = 0;
 unsigned long   s_last_byte = 0;
 
+unsigned long s_rx_bytes = 0, s_rx_lines = 0;
+unsigned long s_n_h = 0, s_n_r = 0, s_n_w = 0, s_n_d = 0, s_n_other = 0;
+char          s_last_line[80] = "";
+
 constexpr int kMaxWifi = 12;
 WifiSight s_wifi[kMaxWifi] = {};
 
@@ -65,6 +69,12 @@ void handleLine(char* line) {
 #if C5_LINK_DEBUG
   Serial.print("[c5] "); Serial.println(line);
 #endif
+  s_rx_lines++;
+  strncpy(s_last_line, line, sizeof(s_last_line) - 1); s_last_line[sizeof(s_last_line) - 1] = '\0';
+  switch (line[0]) {
+    case 'H': s_n_h++; break;  case 'R': s_n_r++; break;
+    case 'W': s_n_w++; break;  case 'D': s_n_d++; break;  default: s_n_other++;
+  }
   if (line[0] == 'H') { s_last_hb = millis(); return; }  // H|planewatch-c5|<ver>
   if (line[0] == 'W') {                                  // W|bssid|ssid|rssi|band
     char* t[6]; int n = split(line, t, 6);
@@ -114,6 +124,7 @@ void poll() {
   while (budget-- > 0 && Link.available()) {
     char c = (char)Link.read();
     s_last_byte = millis();
+    s_rx_bytes++;
     if (c == '\n' || c == '\r') {
       if (s_len > 0) { s_line[s_len] = '\0'; handleLine(s_line); s_len = 0; }
     } else if (s_len < sizeof(s_line) - 1) {
@@ -126,6 +137,13 @@ void poll() {
 
 bool          linked()     { return s_last_hb != 0 && (millis() - s_last_hb) < kHeartbeatTimeoutMs; }
 unsigned long lastByteMs() { return s_last_byte; }
+
+void diag(char* out, size_t n) {
+  unsigned long age = s_last_byte ? (millis() - s_last_byte) : 0;
+  snprintf(out, n,
+    "rxpin=%d rx=%luB lines=%lu H=%lu W=%lu R=%lu ?=%lu age=%lums last=\"%s\"",
+    kRxPin, s_rx_bytes, s_rx_lines, s_n_h, s_n_w, s_n_r, s_n_other, age, s_last_line);
+}
 
 size_t wifiSnapshot(WifiSight* out, size_t max) {
   size_t n = 0; unsigned long now = millis();

@@ -180,8 +180,9 @@ static bool beacon_odid_payload(const uint8_t* f, int len, const uint8_t** out, 
   return false;
 }
 
-// ---- frame counters (incremented in sniffer_cb, reported in loop) ----------
+// ---- frame counters + current hop state ------------------------------------
 volatile uint32_t g_n24 = 0, g_n5 = 0;
+static uint8_t g_cur_band = 0, g_cur_ch = 0;
 
 // ---- promiscuous callback (WiFi task — keep it lean) -----------------------
 static void sniffer_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
@@ -227,6 +228,7 @@ static void hop() {
     cur_band = h.band;
   }
   ec = esp_wifi_set_channel(h.ch, WIFI_SECOND_CHAN_NONE);
+  g_cur_band = h.band; g_cur_ch = h.ch;
   if ((eb != ESP_OK || ec != ESP_OK) && millis() - s_last_diag > 2000) {
     s_last_diag = millis();
     LinkSerial.printf("D|hop band=%d ch=%d setband=0x%x setch=0x%x\n",
@@ -307,10 +309,11 @@ void loop() {
   }
 
   static uint32_t last_hb = 0;
-  if (now - last_hb >= HEARTBEAT_MS) {
+  if (now - last_hb >= 1000) {
     last_hb = now;
-    LinkSerial.printf("H|planewatch-c5|%d\n", PROTOCOL_VERSION);
-    LinkSerial.printf("D|frames 2.4=%lu 5=%lu\n", (unsigned long)g_n24, (unsigned long)g_n5);
+    LinkSerial.printf("H|planewatch-c5|%d|up=%lu|hop=%u/%u|n24=%lu|n5=%lu\n",
+                      PROTOCOL_VERSION, (unsigned long)(now / 1000),
+                      g_cur_band, g_cur_ch, (unsigned long)g_n24, (unsigned long)g_n5);
   }
 
   // expire slots silent for >30 s
