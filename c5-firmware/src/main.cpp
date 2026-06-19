@@ -99,6 +99,66 @@ static void store(const uint8_t* mac, const ODID_UAS_Data* tmp, int8_t rssi, uin
   portEXIT_CRITICAL(&s_mux);
 }
 
+// ---- WiFi AP slot table (every beacon, not just drones) --------------------
+struct WSlot {
+  bool     used;
+  uint8_t  bssid[6];
+  char     ssid[33];
+  int8_t   rssi;
+  uint8_t  band;        // 1 = 2.4, 2 = 5
+  uint32_t last;        // last heard (expiry / LRU)
+  uint32_t last_emit;   // last W| sent (throttle)
+};
+static const int kWSlots = 24;
+static WSlot s_wslots[kWSlots];
+
+static WSlot* wslot_for(const uint8_t* bssid) {
+  int freeIdx = -1, oldest = 0; uint32_t oldT = 0xFFFFFFFF;
+  for (int i = 0; i < kWSlots; ++i) {
+    if (s_wslots[i].used && memcmp(s_wslots[i].bssid, bssid, 6) == 0) return &s_wslots[i];
+    if (!s_wslots[i].used && freeIdx < 0) freeIdx = i;
+    if (s_wslots[i].used && s_wslots[i].last < oldT) { oldT = s_wslots[i].last; oldest = i; }
+  }
+  int idx = (freeIdx >= 0) ? freeIdx : oldest;
+  WSlot& w = s_wslots[idx];
+  memset(&w, 0, sizeof(w));
+  w.used = true; memcpy(w.bssid, bssid, 6);
+  return &w;
+}
+
+static void store_wifi(const uint8_t* bssid, const char* ssid, int8_t rssi, uint8_t band) {
+  portENTER_CRITICAL(&s_mux);
+  WSlot* w = wslot_for(bssid);
+  strncpy(w->ssid, ssid, sizeof(w->ssid) - 1); w->ssid[sizeof(w->ssid) - 1] = '\0';
+  w->rssi = rssi; w->band = band; w->last = millis();
+  portEXIT_CRITICAL(&s_mux);
+}
+
+// ---- SSID extractor ---------------------------------------------------------
+// Pulls element id 0 out of a beacon; sanitizes for the pipe protocol.
+// Empty output = hidden SSID.
+static void beacon_ssid(const uint8_t* f, int len, char* out, int out_sz) {
+  out[0] = '\0';
+  int off = 24 + 12;  // mgmt header (24) + beacon fixed params (12)
+  while (off + 2 <= len) {
+    uint8_t eid = f[off], elen = f[off + 1];
+    if (off + 2 + elen > len) break;
+    if (eid == 0) {  // SSID element (always first in a beacon)
+      int n = elen; if (n > out_sz - 1) n = out_sz - 1;
+      int k = 0; bool any = false;
+      for (int i = 0; i < n; ++i) {
+        uint8_t ch = f[off + 2 + i];
+        if (ch) any = true;
+        out[k++] = (ch < 0x20 || ch == '|' || ch == 0x7f) ? '_' : (char)ch;
+      }
+      out[k] = '\0';
+      if (!any) out[0] = '\0';  // all-zero = hidden
+      return;
+    }
+    off += 2 + elen;
+  }
+}
+
 // ---- beacon vendor-IE OpenDroneID extraction -------------------------------
 // Returns true and fills `out_msg` ptr/len to the OpenDroneID message-pack bytes
 // if the beacon carries the ASD-STAN vendor IE (221 / OUI FA:0B:BC / type 0x0D).
@@ -134,12 +194,14 @@ static void sniffer_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
   memset(&tmp, 0, sizeof(tmp));
 
   if (subtype == 8) {  // beacon
-    const uint8_t* pack; int plen;
+    const uint8_t* bssid = f + 10;           // addr2 = transmitter = BSSID
+    char ssid[33]; beacon_ssid(f, len, ssid, sizeof(ssid));
+    store_wifi(bssid, ssid, rssi, band);     // every AP, drone or not
+
+    const uint8_t* pack; int plen;           // then the existing drone path
     if (!beacon_odid_payload(f, len, &pack, &plen)) return;
-    // decodeOpenDroneID handles single messages and message packs (type 0xF)
     decodeOpenDroneID(&tmp, pack);
-    const uint8_t* sa = f + 10;  // SA is addr2 at offset 10 in mgmt header
-    store(sa, &tmp, rssi, band);
+    store(f + 10, &tmp, rssi, band);
   } else if (subtype == 13) {  // action frame -> try NaN
     char mac[6];
     int r = odid_wifi_receive_message_pack_nan_action_frame(&tmp, mac, f, (size_t)len);
@@ -212,16 +274,35 @@ void loop() {
     if (go) emit(snap);
   }
 
+  // flush WiFi AP sightings as W| lines, throttled to ~once / 3 s per AP
+  for (int i = 0; i < kWSlots; ++i) {
+    WSlot snap; bool go = false;
+    portENTER_CRITICAL(&s_mux);
+    if (s_wslots[i].used && now - s_wslots[i].last_emit >= 3000) {
+      snap = s_wslots[i]; s_wslots[i].last_emit = now; go = true;
+    }
+    portEXIT_CRITICAL(&s_mux);
+    if (go) {
+      int bandLabel = (snap.band == 2) ? 5 : 24;
+      LinkSerial.printf("W|%02x:%02x:%02x:%02x:%02x:%02x|%s|%d|%d\n",
+                        snap.bssid[0], snap.bssid[1], snap.bssid[2],
+                        snap.bssid[3], snap.bssid[4], snap.bssid[5],
+                        snap.ssid, snap.rssi, bandLabel);
+    }
+  }
+
   static uint32_t last_hb = 0;
   if (now - last_hb >= HEARTBEAT_MS) {
     last_hb = now;
     LinkSerial.printf("H|planewatch-c5|%d\n", PROTOCOL_VERSION);
   }
 
-  // expire slots silent for >30 s so a landed drone stops being reported
+  // expire slots silent for >30 s
   portENTER_CRITICAL(&s_mux);
   for (int i = 0; i < kSlots; ++i)
     if (s_slots[i].used && now - s_slots[i].last > 30000) s_slots[i].used = false;
+  for (int i = 0; i < kWSlots; ++i)
+    if (s_wslots[i].used && now - s_wslots[i].last > 30000) s_wslots[i].used = false;
   portEXIT_CRITICAL(&s_mux);
 
   delay(2);

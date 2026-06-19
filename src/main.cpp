@@ -770,77 +770,125 @@ static void drawSurveilScreen() {
 }
 
 // ---------------------------------------------------------------------------
-// RF SCAN — merged WiFi 2.4 GHz + BLE feed, sorted by RSSI
+// RF SCAN — lilac feed: WiFi 2.4 GHz (native) + BLE + 5 GHz (via C5), newest first
 // ---------------------------------------------------------------------------
-static void drawScanScreen() {
-  struct RfContact { uint8_t src; char id[24]; char mac[18]; int8_t rssi; };
-  constexpr int kMaxC = 36;
-  RfContact contacts[kMaxC];
-  int nc = 0;
+static void drawSrcBadge(int x, int y, uint8_t src);   // defined after drawDroneFeed
 
-  for (int i = 0; i < g_ap_count && nc < kMaxC; ++i) {
-    RfContact& c = contacts[nc++];
-    c.src = 0;
-    strncpy(c.id, g_aps[i].ssid[0] ? g_aps[i].ssid : "(hidden)", sizeof(c.id) - 1);
-    c.id[sizeof(c.id) - 1] = '\0';
-    strncpy(c.mac, g_aps[i].bssid, sizeof(c.mac) - 1);
-    c.mac[sizeof(c.mac) - 1] = '\0';
+static char          g_scan_top_mac[18] = "";
+static float         g_scan_anim   = 0.0f;
+static unsigned long g_scan_anim_t = 0;
+static int           g_scan_view   = 0;
+
+static struct { char mac[18]; unsigned long t; } g_rf_seen[48] = {};
+static int g_rf_seen_n = 0;
+static unsigned long rfFirstSeen(const char* mac, bool* is_new) {
+  for (int i = 0; i < g_rf_seen_n; ++i)
+    if (strncmp(g_rf_seen[i].mac, mac, 17) == 0) { if (is_new) *is_new = false; return g_rf_seen[i].t; }
+  int idx;
+  if (g_rf_seen_n < 48) idx = g_rf_seen_n++;
+  else { idx = 0; for (int i = 1; i < 48; ++i) if (g_rf_seen[i].t < g_rf_seen[idx].t) idx = i; }
+  strncpy(g_rf_seen[idx].mac, mac, 17); g_rf_seen[idx].mac[17] = '\0';
+  g_rf_seen[idx].t = millis();
+  if (is_new) *is_new = true;
+  return g_rf_seen[idx].t;
+}
+
+static void drawScanScreen() {
+  cv.fillRect(0, 0, W, H, F_BG);
+
+  struct RfRow { uint8_t src; char id[24]; char mac[18]; int8_t rssi; };
+  RfRow rows[40]; int nc = 0;
+
+  // native WiFi APs — StickS3 radio is 2.4 GHz only
+  for (int i = 0; i < g_ap_count && nc < 40; ++i) {
+    RfRow& c = rows[nc++]; c.src = drone::SRC_WIFI_2G;
+    strncpy(c.id, g_aps[i].ssid[0] ? g_aps[i].ssid : "(hidden)", sizeof(c.id) - 1); c.id[sizeof(c.id)-1] = '\0';
+    strncpy(c.mac, g_aps[i].bssid, sizeof(c.mac) - 1); c.mac[sizeof(c.mac)-1] = '\0';
     c.rssi = g_aps[i].rssi;
   }
-
-  drone::BleSight bs[24];
-  size_t nb = drone::bleSnapshot(bs, 24);
-  for (size_t i = 0; i < nb && nc < kMaxC; ++i) {
-    RfContact& c = contacts[nc++];
-    c.src = 1;
-    const char* label = bs[i].name[0] ? bs[i].name
-                      : bleVendor(bs[i].company_id, bs[i].has_mfr);
-    strncpy(c.id, label ? label : bs[i].mac, sizeof(c.id) - 1);
-    c.id[sizeof(c.id) - 1] = '\0';
-    strncpy(c.mac, bs[i].mac, sizeof(c.mac) - 1);
-    c.mac[sizeof(c.mac) - 1] = '\0';
+  // BLE devices
+  drone::BleSight bs[24]; size_t nb = drone::bleSnapshot(bs, 24);
+  for (size_t i = 0; i < nb && nc < 40; ++i) {
+    RfRow& c = rows[nc++]; c.src = drone::SRC_BLE;
+    const char* label = bs[i].name[0] ? bs[i].name : bleVendor(bs[i].company_id, bs[i].has_mfr);
+    strncpy(c.id, label ? label : bs[i].mac, sizeof(c.id) - 1); c.id[sizeof(c.id)-1] = '\0';
+    strncpy(c.mac, bs[i].mac, sizeof(c.mac) - 1); c.mac[sizeof(c.mac)-1] = '\0';
     c.rssi = bs[i].rssi;
   }
-
-  // sort by RSSI descending (insertion sort; n ≤ 36)
-  for (int i = 1; i < nc; ++i) {
-    RfContact tmp = contacts[i]; int j = i - 1;
-    while (j >= 0 && contacts[j].rssi < tmp.rssi) { contacts[j+1] = contacts[j]; --j; }
-    contacts[j+1] = tmp;
+  // C5-reported WiFi (5 GHz + any 2.4 the native scan missed) — dormant until C5 emits W|
+  c5link::WifiSight ws[24]; size_t nw = c5link::wifiSnapshot(ws, 24);
+  for (size_t i = 0; i < nw && nc < 40; ++i) {
+    bool dup = false;
+    for (int j = 0; j < nc; ++j) if (strncmp(rows[j].mac, ws[i].bssid, 17) == 0) { dup = true; break; }
+    if (dup) continue;
+    RfRow& c = rows[nc++]; c.src = (ws[i].band == 5) ? drone::SRC_WIFI_5G : drone::SRC_WIFI_2G;
+    strncpy(c.id, ws[i].ssid[0] ? ws[i].ssid : "(hidden)", sizeof(c.id) - 1); c.id[sizeof(c.id)-1] = '\0';
+    strncpy(c.mac, ws[i].bssid, sizeof(c.mac) - 1); c.mac[sizeof(c.mac)-1] = '\0';
+    c.rssi = ws[i].rssi;
   }
 
-  if (nc == 0) g_scan_sel = 0;
-  else         g_scan_sel = g_scan_sel % nc;  // wrap
+  int cBle = 0, c24 = 0, c5 = 0;
+  for (int i = 0; i < nc; ++i)
+    switch (rows[i].src) { case drone::SRC_WIFI_5G: ++c5; break; case drone::SRC_WIFI_2G: ++c24; break; default: ++cBle; }
 
-  drawTopBar("RF SCAN");
-  cv.setTextDatum(top_left);
+  // sort: newest first-seen arrival at the top
+  unsigned long fs[40];
+  for (int i = 0; i < nc; ++i) { bool nw2; fs[i] = rfFirstSeen(rows[i].mac, &nw2); }
+  int order[40]; for (int i = 0; i < nc; ++i) order[i] = i;
+  for (int i = 1; i < nc; ++i) { int k = order[i]; int j = i - 1;
+    while (j >= 0 && fs[order[j]] < fs[k]) { order[j+1] = order[j]; --j; } order[j+1] = k; }
+
+  // top bar
+  if (((millis() / 550) % 2) == 0) cv.fillCircle(9, 11, 2, F_ACCENT); else cv.drawCircle(9, 11, 2, F_DIM);
   cv.setTextSize(1);
-  char hdr[20]; snprintf(hdr, sizeof(hdr), "CONTACTS %d", nc);
-  cv.setTextColor(COL_HEAD, COL_BG);
-  cv.drawString(hdr, 8, CONTENT_Y + 2);
+  cv.setTextDatum(middle_left);  cv.setTextColor(F_DIM, F_BG); cv.drawString("rf scan", 17, 11);
+  char tb[12]; cv.setTextDatum(middle_right);
+  cv.setTextColor(F_DIM,    F_BG); snprintf(tb, sizeof(tb), "ble %d", cBle); cv.drawString(tb, 166, 11);
+  cv.setTextColor(F_DIM,    F_BG); snprintf(tb, sizeof(tb), "2.4 %d", c24);  cv.drawString(tb, 200, 11);
+  cv.setTextColor(F_ACCENT, F_BG); snprintf(tb, sizeof(tb), "5g %d",  c5);   cv.drawString(tb, 232, 11);
+  cv.drawFastHLine(0, 22, W, F_HAIR);
 
-  constexpr int kVis = 6;
-  int page_start = (g_scan_sel / kVis) * kVis;
-  int y = CONTENT_Y + 15;
-  for (int i = page_start; i < nc && i < page_start + kVis; ++i) {
-    const RfContact& c = contacts[i];
-    cv.setTextColor(i == g_scan_sel ? COL_HEAD : COL_TEXT, COL_BG);
-    char row[30];
-    snprintf(row, sizeof(row), "%c %-19.19s%4d",
-             c.src == 0 ? 'W' : 'B', c.id, (int)c.rssi);
-    cv.drawString(row, 4, y); y += 13;
-  }
   if (nc == 0) {
-    cv.setTextColor(COL_LABEL, COL_BG);
-    cv.drawString(g_wifi_scanning ? "scanning..." : "--", 8, y);
+    cv.setTextDatum(top_left); cv.setTextColor(F_DIM, F_BG); cv.setTextSize(1);
+    cv.drawString(g_wifi_scanning ? "scanning..." : "watching wifi + ble...", 8, F_TOP + 18);
+    return;
   }
 
-  char c1[10], c2[10], c3[14];
-  snprintf(c1, sizeof(c1), "RF %d", nc);
-  if (nc > 0) snprintf(c2, sizeof(c2), "#%d/%d", g_scan_sel + 1, nc);
-  else        snprintf(c2, sizeof(c2), "#-/-");
-  snprintf(c3, sizeof(c3), "W%d B%u", g_ap_count, (unsigned)nb);
-  drawBottomBar(c1, c2, c3);
+  // slide when a new MAC reaches the top (only while not scrolled down)
+  if (strncmp(rows[order[0]].mac, g_scan_top_mac, 17) != 0) {
+    strncpy(g_scan_top_mac, rows[order[0]].mac, 17); g_scan_top_mac[17] = '\0';
+    if (g_scan_view == 0) { g_scan_anim = (float)F_ROW_H; g_scan_anim_t = millis(); }
+  }
+  if (g_scan_anim > 0.0f) {
+    unsigned long now2 = millis();
+    g_scan_anim -= (float)(now2 - g_scan_anim_t) * F_ROW_H / 300.0f; g_scan_anim_t = now2;
+    if (g_scan_anim < 0.0f) g_scan_anim = 0.0f;
+  }
+  int off = (g_scan_view == 0) ? (int)(g_scan_anim + 0.5f) : 0;
+
+  // clamp + scroll window
+  if (g_scan_sel >= nc) g_scan_sel = nc - 1;
+  if (g_scan_sel < 0)   g_scan_sel = 0;
+  const int kVis = 5;
+  if (g_scan_sel < g_scan_view)         g_scan_view = g_scan_sel;
+  if (g_scan_sel >= g_scan_view + kVis) g_scan_view = g_scan_sel - kVis + 1;
+
+  cv.setClipRect(0, F_TOP, W, F_WIN_H);
+  for (int vis = 0; vis <= kVis && (g_scan_view + vis) < nc; ++vis) {
+    int idx = g_scan_view + vis;
+    const RfRow& c = rows[order[idx]];
+    int y = F_TOP + vis * F_ROW_H - off;
+    bool sel = (idx == g_scan_sel);
+    uint16_t bg = sel ? F_SELROW : F_BG;
+    if (sel) { cv.fillRect(4, y, 232, F_ROW_H, F_SELROW); cv.fillRect(4, y, 2, F_ROW_H, F_ACCENT); }
+    drawSrcBadge(8, y + 4, c.src);
+    cv.setTextSize(1);
+    cv.setTextDatum(middle_left);  cv.setTextColor(F_TEXT, bg); cv.drawString(c.id, 40, y + 11);
+    char meta[8]; snprintf(meta, sizeof(meta), "%d", c.rssi);
+    cv.setTextDatum(middle_right); cv.setTextColor(F_DIM, bg);  cv.drawString(meta, 232, y + 11);
+    cv.drawFastHLine(8, y + F_ROW_H - 1, 224, F_HAIR);
+  }
+  cv.clearClipRect();
 }
 
 // ---------------------------------------------------------------------------

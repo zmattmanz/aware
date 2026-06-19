@@ -30,6 +30,25 @@ size_t          s_len     = 0;
 unsigned long   s_last_hb = 0;
 unsigned long   s_last_byte = 0;
 
+constexpr int kMaxWifi = 12;
+WifiSight s_wifi[kMaxWifi] = {};
+
+void ingestWifi(const char* bssid, const char* ssid, int8_t rssi, uint8_t band) {
+  int idx = -1, oldest = 0; unsigned long ot = 0xFFFFFFFFUL;
+  for (int i = 0; i < kMaxWifi; ++i) {
+    if (s_wifi[i].last_seen && strncmp(s_wifi[i].bssid, bssid, 17) == 0) { idx = i; break; }
+    if (s_wifi[i].last_seen < ot) { ot = s_wifi[i].last_seen; oldest = i; }
+  }
+  if (idx < 0) {
+    idx = oldest;
+    memset(&s_wifi[idx], 0, sizeof(s_wifi[idx]));
+    strncpy(s_wifi[idx].bssid, bssid, 17); s_wifi[idx].bssid[17] = '\0';
+  }
+  strncpy(s_wifi[idx].ssid, ssid ? ssid : "", sizeof(s_wifi[idx].ssid) - 1);
+  s_wifi[idx].ssid[sizeof(s_wifi[idx].ssid) - 1] = '\0';
+  s_wifi[idx].rssi = rssi; s_wifi[idx].band = band; s_wifi[idx].last_seen = millis();
+}
+
 // split src on '|' into tok[] (max maxTok). returns count. mutates src in place.
 int split(char* src, char* tok[], int maxTok) {
   int n = 0;
@@ -47,6 +66,11 @@ void handleLine(char* line) {
   Serial.print("[c5] "); Serial.println(line);
 #endif
   if (line[0] == 'H') { s_last_hb = millis(); return; }  // H|planewatch-c5|<ver>
+  if (line[0] == 'W') {                                  // W|bssid|ssid|rssi|band
+    char* t[6]; int n = split(line, t, 6);
+    if (n >= 5 && t[1][0]) ingestWifi(t[1], t[2], (int8_t)atoi(t[3]), (uint8_t)atoi(t[4]));
+    return;
+  }
   if (line[0] != 'R') return;                            // only R| carries detections
 
   // R|mac|uasid|rssi|band|dlat|dlon|olat|olon|speed|track
@@ -100,5 +124,14 @@ void poll() {
 
 bool          linked()     { return s_last_hb != 0 && (millis() - s_last_hb) < kHeartbeatTimeoutMs; }
 unsigned long lastByteMs() { return s_last_byte; }
+
+size_t wifiSnapshot(WifiSight* out, size_t max) {
+  size_t n = 0; unsigned long now = millis();
+  for (int i = 0; i < kMaxWifi && n < max; ++i) {
+    if (!s_wifi[i].last_seen || now - s_wifi[i].last_seen > 20000) continue;
+    out[n++] = s_wifi[i];
+  }
+  return n;
+}
 
 }  // namespace c5link

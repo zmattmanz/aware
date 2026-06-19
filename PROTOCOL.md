@@ -55,6 +55,23 @@ The C5 re-sends an `R|` line for each drone at most every 3 seconds. The
 StickS3 accumulates Location and System data across successive `R|` lines for
 the same drone (keyed by UAS ID when available, otherwise by MAC).
 
+### `W|` — WiFi beacon / AP sighting
+
+```
+W|bssid|ssid|rssi|band
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| bssid | string | AP MAC, lowercase `aa:bb:cc:dd:ee:ff` |
+| ssid  | string | Network name; empty if hidden; pipes escaped to `_` |
+| rssi  | int   | Received signal strength, dBm (negative) |
+| band  | int   | `24` = 2.4 GHz, `5` = 5 GHz |
+
+Emitted for each beacon frame the C5 hears that does not carry an ODID payload.
+The StickS3 stores these for up to 20 s and surfaces them on the RF Scan screen
+with a `2.4` or `5g` badge.
+
 ### `H|` — Heartbeat
 
 ```
