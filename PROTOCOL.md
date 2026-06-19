@@ -11,8 +11,15 @@
 | Power | 5V pad | red | 5V |
 | Ground | GND pad | black | GND |
 
-The C5's debug console is on its USB-C port (native USB-Serial/JTAG). USB CDC
-on Boot must be enabled so UART0 pads are free for the Grove link.
+USB CDC on Boot is *disabled* on the C5 (`ARDUINO_USB_CDC_ON_BOOT=0`), so
+`Serial` maps to UART0 on the TXD/RXD pads. The C5's own USB port shows
+nothing — read the link on the StickS3.
+
+> **Caution:** G0 on the StickS3 is the ESP32-S3 boot strapping pin. It works
+> as Serial1 RX but if the C5 drives the line during S3 power-up the S3 can
+> misboot / enter download mode. If the link won't come up, power the C5 after
+> the S3 has fully booted, or move the RX wire to a plain GPIO and update
+> `kRxPin` in `c5_link.cpp`.
 
 ## Message format
 
@@ -76,13 +83,14 @@ Most production drones broadcast via beacons, which covers the common case.
 
 ## StickS3 ingest (c5_link module)
 
-`c5_link::begin()` opens Serial1 at 115200 bps (GPIO0 RX, GPIO26 TX).
+`c5_link::begin()` opens Serial1 at 115200 bps (GPIO0 RX, TX unused).
 `c5_link::poll()` is called from `loop()`; it drains available bytes and
-calls `drone::ingestExternal()` for each valid `R|` line.
+calls `drone::ingestC5()` for each valid `R|` line.
 
-`drone::ingestExternal()` searches the drone table by UAS ID first (to
-merge WiFi and BLE sightings of the same drone), falls back to MAC, and
-marks the entry with `SRC_WIFI_C5` in its source bitmask.
+`drone::ingestC5()` writes directly into the shared drone table (keyed by
+MAC), setting the same `uas.*Valid` flags that `snapshot()` reads. C5-sourced
+drones appear on the drones screen alongside BLE-sourced ones with no UI
+change required.
 
 ## Future (not yet implemented)
 

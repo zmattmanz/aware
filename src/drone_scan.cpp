@@ -40,6 +40,7 @@ struct Entry {
   bool          used;
   char          mac[18];
   int8_t        rssi;
+  uint8_t       source;   // DroneSource
   unsigned long last_seen;
   ODID_UAS_Data uas;
 };
@@ -120,6 +121,7 @@ class ScanCb : public NimBLEScanCallbacks {
     Entry* e = findOrCreate(mac);
     e->rssi = (int8_t)dev->getRSSI();
     e->last_seen = millis();
+    e->source = SRC_BLE;
     decodeOpenDroneID(&e->uas, msg);  // sets the relevant *Valid flag(s)
     if (s_lock) xSemaphoreGive(s_lock);
   }
@@ -161,6 +163,7 @@ size_t snapshot(Drone* out, size_t max) {
     memset(&d, 0, sizeof(d));
     strncpy(d.mac, e.mac, 17);
     d.rssi = e.rssi;
+    d.source = e.source;
     d.last_seen_ms = e.last_seen;
     for (int b = 0; b < ODID_BASIC_ID_MAX_MESSAGES; ++b) {
       if (e.uas.BasicIDValid[b]) {
@@ -184,6 +187,34 @@ size_t snapshot(Drone* out, size_t max) {
   }
   if (s_lock) xSemaphoreGive(s_lock);
   return n;
+}
+
+void ingestC5(const char* mac, const char* id, int8_t rssi, uint8_t band,
+              bool has_loc, double lat, double lon, float speed, float dir,
+              bool has_op, double op_lat, double op_lon) {
+  if (!mac || !mac[0]) return;
+  if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY);
+  Entry* e = findOrCreate(mac);
+  e->rssi = rssi;
+  e->last_seen = millis();
+  e->source = (band == 5 || band == 2) ? SRC_WIFI_5G : SRC_WIFI_2G;
+  if (id && id[0]) {
+    strncpy(e->uas.BasicID[0].UASID, id, sizeof(e->uas.BasicID[0].UASID) - 1);
+    e->uas.BasicIDValid[0] = 1;
+  }
+  if (has_loc) {
+    e->uas.Location.Latitude        = lat;
+    e->uas.Location.Longitude       = lon;
+    e->uas.Location.SpeedHorizontal = speed;
+    e->uas.Location.Direction       = dir;
+    e->uas.LocationValid            = 1;
+  }
+  if (has_op) {
+    e->uas.System.OperatorLatitude  = op_lat;
+    e->uas.System.OperatorLongitude = op_lon;
+    e->uas.SystemValid              = 1;
+  }
+  if (s_lock) xSemaphoreGive(s_lock);
 }
 
 size_t bleSnapshot(BleSight* out, size_t max) {

@@ -178,9 +178,10 @@ static void emit(const Slot& s) {
     snprintf(oplat, sizeof(oplat), "%.6f", s.uas.System.OperatorLatitude);
     snprintf(oplon, sizeof(oplon), "%.6f", s.uas.System.OperatorLongitude);
   }
+  int bandLabel = (s.band == 2) ? 5 : 24;
   LinkSerial.printf("R|%02x:%02x:%02x:%02x:%02x:%02x|%s|%d|%d|%s|%s|%s|%s|%s|%s\n",
                     s.mac[0], s.mac[1], s.mac[2], s.mac[3], s.mac[4], s.mac[5],
-                    id, s.rssi, s.band, dlat, dlon, oplat, oplon, spd, trk);
+                    id, s.rssi, bandLabel, dlat, dlon, oplat, oplon, spd, trk);
 }
 
 // ---------------------------------------------------------------------------
