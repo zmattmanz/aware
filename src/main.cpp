@@ -1097,7 +1097,6 @@ void setup() {
 
   surveil::begin();
   drone::begin();  // BLE Remote ID scan + surveil ingest run continuously from here on
-  c5link::begin();
   g_bleScanRunning = true;
 }
 
@@ -1133,6 +1132,8 @@ static void animateCardFlip(int newRot) {
 
 void loop() {
   M5.update();
+  static bool s_c5_up = false;
+  if (!s_c5_up) { s_c5_up = true; c5link::begin(); }
   c5link::poll();  // drain C5 UART every iteration so it never backs up
   { static unsigned long s_c5diag_t = 0;
     if (millis() - s_c5diag_t > 1000) {

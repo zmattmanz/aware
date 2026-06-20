@@ -35,13 +35,11 @@ extern "C" {
 #define LINK_BAUD        115200
 #define HEARTBEAT_MS     3000
 #define CHANNEL_DWELL_MS 350
-// UART0 (the TXD/RXD pads) is the link to the StickS3 — same as Plume.
-// On the ESP32-C5 Arduino core, `Serial` maps to UART0. We deliberately do NOT
-// enable USB-CDC-on-boot (it mis-maps to a nonexistent USBSerial on this chip).
-// NOTE: output goes out the UART pads, NOT the USB port — to watch it, read it
-// on the StickS3 (or hang a USB-TTL adapter on the TX pad). `pio device monitor`
-// over the C5's own USB will show nothing. This matches how Plume's C5 worked.
-#define LinkSerial Serial
+// Serial0 = UART0 TXD/RXD pads -> StickS3 (protocol only: H|/R|/W|).
+// IDF logs are silenced in setup() via esp_log_level_set so nothing but our
+// protocol rides the link wire. (ESP32-C5 has USB-Serial-JTAG, not USB-CDC,
+// so Serial and Serial0 both map to UART0 — Serial0 is the explicit name.)
+#define LinkSerial  Serial0   // UART0 pads -> StickS3
 
 // Dual-band hop list. band: 1 = 2.4 GHz, 2 = 5 GHz.
 // ch6 (2.4) and ch149/44 (5) are the NaN/Wi-Fi-Aware social channels — dwell
@@ -220,7 +218,6 @@ static int g_hop = 0;
 static uint32_t g_last_hop = 0;
 static void hop() {
   static uint8_t cur_band = 0;
-  static uint32_t s_last_diag = 0;
   const Hop& h = kHops[g_hop];
   esp_err_t eb = ESP_OK, ec;
   if (h.band != cur_band) {
@@ -229,11 +226,6 @@ static void hop() {
   }
   ec = esp_wifi_set_channel(h.ch, WIFI_SECOND_CHAN_NONE);
   g_cur_band = h.band; g_cur_ch = h.ch;
-  if ((eb != ESP_OK || ec != ESP_OK) && millis() - s_last_diag > 2000) {
-    s_last_diag = millis();
-    LinkSerial.printf("D|hop band=%d ch=%d setband=0x%x setch=0x%x\n",
-                      h.band, h.ch, (unsigned)eb, (unsigned)ec);
-  }
   g_hop = (g_hop + 1) % kHopCount;
 }
 
@@ -262,8 +254,7 @@ static void emit(const Slot& s) {
 
 // ---------------------------------------------------------------------------
 void setup() {
-  esp_log_level_set("*", ESP_LOG_NONE);      // nothing rides UART0 but our H|/R|/W| lines
-
+  esp_log_level_set("*", ESP_LOG_NONE);      // silence IDF logs — nothing rides the link but H|/R|/W|
   LinkSerial.begin(LINK_BAUD, SERIAL_8N1);  // UART0 pads -> StickS3
   delay(200);
 
@@ -309,11 +300,9 @@ void loop() {
   }
 
   static uint32_t last_hb = 0;
-  if (now - last_hb >= 1000) {
+  if (now - last_hb >= HEARTBEAT_MS) {
     last_hb = now;
-    LinkSerial.printf("H|planewatch-c5|%d|up=%lu|hop=%u/%u|n24=%lu|n5=%lu\n",
-                      PROTOCOL_VERSION, (unsigned long)(now / 1000),
-                      g_cur_band, g_cur_ch, (unsigned long)g_n24, (unsigned long)g_n5);
+    LinkSerial.printf("H|planewatch-c5|%d\n", PROTOCOL_VERSION);
   }
 
   // expire slots silent for >30 s

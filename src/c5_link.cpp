@@ -6,28 +6,29 @@
 #include <cstdlib>
 
 // === DIAGNOSTIC ============================================================
-// 1 = echo every received line + parse result to the USB console
-//     (pio device monitor on the StickS3). Use this to confirm the link.
-// 0 = silent, normal operation.
+// 1 = echo every received line + a 1-line status to the USB console (Serial).
+// 0 = silent.
 #define C5_LINK_DEBUG 1
 // ===========================================================================
 
 namespace c5link {
 namespace {
 
-// --- WIRING (match your actual wiring!) ------------------------------------
-// One-way link: C5 UART0 TXD  ->  StickS3 kRxPin.
-// PROTOCOL.md uses G0. GPIO0 is the S3 boot strapping pin (see task §0) — if the
-// link won't come up, move this wire to a plain GPIO and change kRxPin to match.
-constexpr int      kRxPin = 0;     // StickS3 RX  <-  C5 TXD
-constexpr int      kTxPin = -1;    // unused (C5 -> S3 only)
+// --- LINK (copied from Plume's working Cardputer config) -------------------
+//   UART1 on Grove G1/G2.  RX = GPIO2 (S3 RX <- C5 TXD).  3.3 V both ends.
+//   Receive-only here, so no TX pin is driven (Plume drives G1; we don't need it).
+//   The C5 MUST have its own power — running it off the StickS3's Grove 5 V
+//   browns out the S3 and causes reset-cycling.
+constexpr int      kRxPin = 2;     // Grove G2 — StickS3 RX <- C5 TXD
+constexpr int      kTxPin = -1;    // unused (link is C5 -> S3 only)
 constexpr uint32_t kBaud  = 115200;
 constexpr uint32_t kHeartbeatTimeoutMs = 8000;
 
-HardwareSerial& Link = Serial1;    // Serial = USB-CDC on this build; Serial1 is free
+HardwareSerial  SerialC5(1);       // UART1, like Plume's `HardwareSerial SerialC5(1)`
+bool            s_started   = false;
 char            s_line[256];
-size_t          s_len     = 0;
-unsigned long   s_last_hb = 0;
+size_t          s_len       = 0;
+unsigned long   s_last_hb   = 0;
 unsigned long   s_last_byte = 0;
 
 unsigned long s_rx_bytes = 0, s_rx_lines = 0;
@@ -53,15 +54,9 @@ void ingestWifi(const char* bssid, const char* ssid, int8_t rssi, uint8_t band) 
   s_wifi[idx].rssi = rssi; s_wifi[idx].band = band; s_wifi[idx].last_seen = millis();
 }
 
-// split src on '|' into tok[] (max maxTok). returns count. mutates src in place.
 int split(char* src, char* tok[], int maxTok) {
-  int n = 0;
-  char* p = src;
-  tok[n++] = p;
-  while (*p && n < maxTok) {
-    if (*p == '|') { *p = '\0'; tok[n++] = p + 1; }
-    ++p;
-  }
+  int n = 0; char* p = src; tok[n++] = p;
+  while (*p && n < maxTok) { if (*p == '|') { *p = '\0'; tok[n++] = p + 1; } ++p; }
   return n;
 }
 
@@ -75,19 +70,16 @@ void handleLine(char* line) {
     case 'H': s_n_h++; break;  case 'R': s_n_r++; break;
     case 'W': s_n_w++; break;  case 'D': s_n_d++; break;  default: s_n_other++;
   }
-  if (line[0] == 'H') { s_last_hb = millis(); return; }  // H|planewatch-c5|<ver>
-  if (line[0] == 'W') {                                  // W|bssid|ssid|rssi|band
+  if (line[0] == 'H') { s_last_hb = millis(); return; }   // H|planewatch-c5|<ver>
+  if (line[0] == 'W') {                                   // W|bssid|ssid|rssi|band
     char* t[6]; int n = split(line, t, 6);
     if (n >= 5 && t[1][0]) ingestWifi(t[1], t[2], (int8_t)atoi(t[3]), (uint8_t)atoi(t[4]));
     return;
   }
-  if (line[0] != 'R') return;                            // only R| carries detections
+  if (line[0] != 'R') return;                             // R| = drone detection
 
-  // R|mac|uasid|rssi|band|dlat|dlon|olat|olon|speed|track
-  char* t[12];
-  int n = split(line, t, 12);
-  if (n < 5 || !t[1][0]) return;                         // need at least a MAC
-
+  char* t[12]; int n = split(line, t, 12);
+  if (n < 5 || !t[1][0]) return;
   const char* mac = t[1];
   const char* id  = t[2];
   int8_t  rssi    = (int8_t)atoi(t[3]);
@@ -100,29 +92,30 @@ void handleLine(char* line) {
   double oplon    = has_op  ? atof(t[8]) : 0.0;
   float  speed    = (n > 9  && t[9][0])  ? (float)atof(t[9])  : 0.0f;
   float  track    = (n > 10 && t[10][0]) ? (float)atof(t[10]) : 0.0f;
-
   drone::ingestC5(mac, id, rssi, band, has_loc, lat, lon, speed, track, has_op, oplat, oplon);
-#if C5_LINK_DEBUG
-  Serial.printf("[c5] -> drone mac=%s id=%s rssi=%d loc=%d op=%d\n",
-                mac, id, rssi, (int)has_loc, (int)has_op);
-#endif
 }
 
 }  // namespace
 
+// ── Plume's c5_link_begin(), adapted ──────────────────────────────────────
 void begin() {
-  Link.setRxBufferSize(2048);               // ride out log bursts between polls
-  Link.begin(kBaud, SERIAL_8N1, kRxPin, kTxPin);
+  if (s_started) return;
+  SerialC5.setRxBufferSize(512);                          // must precede begin()
+  SerialC5.begin(kBaud, SERIAL_8N1, kRxPin, kTxPin);
+  s_len = 0;
+  s_started = true;
 #if C5_LINK_DEBUG
-  Serial.printf("[c5] link up: Serial1 rx=%d tx=%d @%lu\n",
+  Serial.printf("[c5] link up: UART1 rx=%d tx=%d @%lu (Grove)\n",
                 kRxPin, kTxPin, (unsigned long)kBaud);
 #endif
 }
 
+// ── Plume's process_c5_serial(), with a byte budget so a flood can't stall ──
 void poll() {
-  int budget = 1024;                        // cap bytes per call so a flood can't stall the main loop
-  while (budget-- > 0 && Link.available()) {
-    char c = (char)Link.read();
+  if (!s_started) return;
+  int budget = 1024;
+  while (budget-- > 0 && SerialC5.available() > 0) {
+    char c = (char)SerialC5.read();
     s_last_byte = millis();
     s_rx_bytes++;
     if (c == '\n' || c == '\r') {
@@ -130,7 +123,7 @@ void poll() {
     } else if (s_len < sizeof(s_line) - 1) {
       s_line[s_len++] = c;
     } else {
-      s_len = 0;  // overrun — resync on next newline
+      s_len = 0;
     }
   }
 }
