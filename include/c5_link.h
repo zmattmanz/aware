@@ -2,17 +2,16 @@
 #include <cstdint>
 #include <cstddef>
 
-// Receives the ESP32-C5 WiFi Remote ID sniffer's UART stream (see PROTOCOL.md)
-// and merges decoded drones into the shared drone table (drone_scan).
 namespace c5link {
-void          begin();        // open the UART link from the C5 (call once, from loop — NOT setup)
+void          begin();        // open + auto-hunt the Grove RX pin (call once, from loop)
 void          poll();         // call every loop(): drains UART, parses, feeds table
 bool          linked();       // true if a C5 heartbeat arrived within the last 8 s
-unsigned long lastByteMs();   // millis() of last byte received (0 = never)
-unsigned long frames24();     // C5's cumulative 2.4 GHz frame count (from heartbeat)
-unsigned long frames5();      // C5's cumulative 5 GHz frame count (from heartbeat)
+unsigned long lastByteMs();
+unsigned long frames24();     // C5's 2.4 GHz frame count (from heartbeat)
+unsigned long frames5();      // C5's 5 GHz frame count (from heartbeat)
+int           rxPin();        // Grove GPIO currently being listened on
+unsigned long rxBytes();      // total bytes received (>0 means the wire is good)
 
-// WiFi beacon sightings reported by the C5 (W| lines)
 struct WifiSight {
   char          bssid[18];
   char          ssid[24];

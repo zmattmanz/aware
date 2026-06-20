@@ -763,9 +763,7 @@ static void drawConnScreen() {
       wifiUp ? "online" : "offline", v);
 
   char cBat[10]; snprintf(cBat, sizeof(cBat), "%d%%", battPctFromMv(M5.Power.getBatteryVoltage()));
-  char cC5[12]; unsigned long lb = c5link::lastByteMs();
-  if (lb) snprintf(cC5, sizeof(cC5), "C5 %lus", (millis() - lb) / 1000);
-  else    snprintf(cC5, sizeof(cC5), "C5 --");
+  char cC5[16]; snprintf(cC5, sizeof(cC5), "rx%d %luB", c5link::rxPin(), c5link::rxBytes());
   drawBottomBar(cBat, cC5, "LINKS");
 }
 

@@ -2,7 +2,7 @@
 #include "drone_scan.h"
 
 #include <Arduino.h>
-#include <M5Unified.h>          // M5.getPin() — ask the board for its real Grove GPIOs
+#include <M5Unified.h>
 #include <cstring>
 #include <cstdlib>
 
@@ -14,24 +14,30 @@ namespace {
 constexpr int      kRxFallback = 2;
 constexpr uint32_t kBaud  = 115200;
 constexpr uint32_t kHeartbeatTimeoutMs = 8000;
+constexpr uint32_t kHuntIntervalMs     = 4000;   // how long to try a pin before swapping
 
-HardwareSerial  SerialC5(1);       // UART1
-int             s_rxPin     = -1;
-int             s_pin1      = -1;
-int             s_pin2      = -1;
-bool            s_started   = false;
+HardwareSerial  SerialC5(1);
+int             s_pin1   = -1, s_pin2 = -1;
+int             s_curRx  = -1;            // pin currently being listened on
+bool            s_started = false;
+unsigned long   s_last_switch = 0;
 char            s_line[256];
-size_t          s_len       = 0;
-unsigned long   s_last_hb   = 0;
-unsigned long   s_last_byte = 0;
+size_t          s_len = 0;
+unsigned long   s_last_hb = 0, s_last_byte = 0;
 
 unsigned long s_rx_bytes = 0, s_rx_lines = 0;
 unsigned long s_n_h = 0, s_n_r = 0, s_n_w = 0, s_n_d = 0, s_n_other = 0;
-unsigned long s_hb_n24 = 0, s_hb_n5 = 0;   // 2.4/5 GHz frame counts from the C5 heartbeat
+unsigned long s_hb_n24 = 0, s_hb_n5 = 0;
 char          s_last_line[80] = "";
 
-constexpr int kMaxWifi = 24;       // bigger table so 5 GHz APs aren't evicted by the 2.4 flood
+constexpr int kMaxWifi = 24;
 WifiSight s_wifi[kMaxWifi] = {};
+
+void openUart(int rx) {
+  SerialC5.end();
+  SerialC5.setRxBufferSize(512);
+  SerialC5.begin(kBaud, SERIAL_8N1, rx, -1);   // receive-only
+}
 
 void ingestWifi(const char* bssid, const char* ssid, int8_t rssi, uint8_t band) {
   int idx = -1, oldest = 0; unsigned long ot = 0xFFFFFFFFUL;
@@ -65,34 +71,30 @@ void handleLine(char* line) {
     case 'H': s_n_h++; break;  case 'R': s_n_r++; break;
     case 'W': s_n_w++; break;  case 'D': s_n_d++; break;  default: s_n_other++;
   }
-  if (line[0] == 'H') {                                   // H|planewatch-c5|<ver>[|up=..|hop=../..|n24=..|n5=..]
+  if (line[0] == 'H') {
     s_last_hb = millis();
     const char* p;
     if ((p = strstr(line, "n24=")) != nullptr) s_hb_n24 = strtoul(p + 4, nullptr, 10);
     if ((p = strstr(line, "n5="))  != nullptr) s_hb_n5  = strtoul(p + 3, nullptr, 10);
     return;
   }
-  if (line[0] == 'W') {                                   // W|bssid|ssid|rssi|band
+  if (line[0] == 'W') {
     char* t[6]; int n = split(line, t, 6);
     if (n >= 5 && t[1][0]) ingestWifi(t[1], t[2], (int8_t)atoi(t[3]), (uint8_t)atoi(t[4]));
     return;
   }
-  if (line[0] != 'R') return;                             // R| = drone detection
-
+  if (line[0] != 'R') return;
   char* t[12]; int n = split(line, t, 12);
   if (n < 5 || !t[1][0]) return;
-  const char* mac = t[1];
-  const char* id  = t[2];
-  int8_t  rssi    = (int8_t)atoi(t[3]);
-  uint8_t band    = (n > 4 && t[4][0]) ? (uint8_t)atoi(t[4]) : 24;
-  bool   has_loc  = (n > 6  && t[5][0] && t[6][0]);
-  double lat      = has_loc ? atof(t[5]) : 0.0;
-  double lon      = has_loc ? atof(t[6]) : 0.0;
-  bool   has_op   = (n > 8  && t[7][0] && t[8][0]);
-  double oplat    = has_op  ? atof(t[7]) : 0.0;
-  double oplon    = has_op  ? atof(t[8]) : 0.0;
-  float  speed    = (n > 9  && t[9][0])  ? (float)atof(t[9])  : 0.0f;
-  float  track    = (n > 10 && t[10][0]) ? (float)atof(t[10]) : 0.0f;
+  const char* mac = t[1]; const char* id = t[2];
+  int8_t  rssi = (int8_t)atoi(t[3]);
+  uint8_t band = (n > 4 && t[4][0]) ? (uint8_t)atoi(t[4]) : 24;
+  bool   has_loc = (n > 6 && t[5][0] && t[6][0]);
+  double lat = has_loc ? atof(t[5]) : 0.0, lon = has_loc ? atof(t[6]) : 0.0;
+  bool   has_op = (n > 8 && t[7][0] && t[8][0]);
+  double oplat = has_op ? atof(t[7]) : 0.0, oplon = has_op ? atof(t[8]) : 0.0;
+  float  speed = (n > 9 && t[9][0]) ? (float)atof(t[9]) : 0.0f;
+  float  track = (n > 10 && t[10][0]) ? (float)atof(t[10]) : 0.0f;
   drone::ingestC5(mac, id, rssi, band, has_loc, lat, lon, speed, track, has_op, oplat, oplon);
 }
 
@@ -100,21 +102,30 @@ void handleLine(char* line) {
 
 void begin() {
   if (s_started) return;
-  s_pin1 = M5.getPin(m5::pin_name_t::port_a_pin1);   // Grove RX line
+  s_pin1 = M5.getPin(m5::pin_name_t::port_a_pin1);
   s_pin2 = M5.getPin(m5::pin_name_t::port_a_pin2);
-  s_rxPin = (s_pin1 >= 0) ? s_pin1 : kRxFallback;
-  SerialC5.setRxBufferSize(512);
-  SerialC5.begin(kBaud, SERIAL_8N1, s_rxPin, -1);
-  s_len = 0;
+  s_curRx = (s_pin1 >= 0) ? s_pin1 : kRxFallback;
+  openUart(s_curRx);
+  s_last_switch = millis();
   s_started = true;
 #if C5_LINK_DEBUG
-  Serial.printf("[c5] Grove port_a pin1=%d pin2=%d -> using RX=%d @%lu\n",
-                s_pin1, s_pin2, s_rxPin, (unsigned long)kBaud);
+  Serial.printf("[c5] Grove port_a pin1=%d pin2=%d -> start RX=%d (auto-hunt)\n",
+                s_pin1, s_pin2, s_curRx);
 #endif
 }
 
 void poll() {
   if (!s_started) return;
+  // Auto-locate the Grove RX line: until the first heartbeat proves we're on the
+  // wire the C5's TXD is connected to, alternate between the two Grove signal pins.
+  if (s_n_h == 0 && s_pin1 >= 0 && s_pin2 >= 0 && (millis() - s_last_switch) > kHuntIntervalMs) {
+    s_curRx = (s_curRx == s_pin1) ? s_pin2 : s_pin1;
+    openUart(s_curRx);
+    s_last_switch = millis();
+#if C5_LINK_DEBUG
+    Serial.printf("[c5] no heartbeat yet — trying RX=%d\n", s_curRx);
+#endif
+  }
   int budget = 1024;
   while (budget-- > 0 && SerialC5.available() > 0) {
     char c = (char)SerialC5.read();
@@ -124,22 +135,22 @@ void poll() {
       if (s_len > 0) { s_line[s_len] = '\0'; handleLine(s_line); s_len = 0; }
     } else if (s_len < sizeof(s_line) - 1) {
       s_line[s_len++] = c;
-    } else {
-      s_len = 0;
-    }
+    } else { s_len = 0; }
   }
 }
 
 bool          linked()     { return s_last_hb != 0 && (millis() - s_last_hb) < kHeartbeatTimeoutMs; }
 unsigned long lastByteMs() { return s_last_byte; }
-unsigned long frames24()   { return s_hb_n24; }   // cumulative 2.4 GHz frames the C5 has captured
-unsigned long frames5()    { return s_hb_n5;  }   // cumulative 5 GHz frames the C5 has captured
+unsigned long frames24()   { return s_hb_n24; }
+unsigned long frames5()    { return s_hb_n5; }
+int           rxPin()      { return s_curRx; }       // pin it's currently listening on
+unsigned long rxBytes()    { return s_rx_bytes; }    // total bytes received (>0 = wire is good)
 
 void diag(char* out, size_t n) {
   unsigned long age = s_last_byte ? (millis() - s_last_byte) : 0;
   snprintf(out, n,
-    "rx=%d(p1=%d,p2=%d) bytes=%luB H=%lu W=%lu R=%lu n24=%lu n5=%lu age=%lums last=\"%s\"",
-    s_rxPin, s_pin1, s_pin2, s_rx_bytes, s_n_h, s_n_w, s_n_r, s_hb_n24, s_hb_n5, age, s_last_line);
+    "rx=%d(p1=%d,p2=%d) bytes=%luB H=%lu W=%lu n24=%lu n5=%lu age=%lums last=\"%s\"",
+    s_curRx, s_pin1, s_pin2, s_rx_bytes, s_n_h, s_n_w, s_hb_n24, s_hb_n5, age, s_last_line);
 }
 
 size_t wifiSnapshot(WifiSight* out, size_t max) {
