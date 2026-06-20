@@ -73,7 +73,7 @@ static constexpr int CONTENT_H = H - TOPBAR_H - BOTBAR_H - 2;
 static M5Canvas cv(&M5.Display);
 
 // ---- screens ---------------------------------------------------------------
-enum Screen { SCR_AIRSPACE = 0, SCR_DRONES, SCR_SURVEIL, SCR_SCAN, SCR_STATS, SCR_SETUP, SCR_COUNT };
+enum Screen { SCR_AIRSPACE = 0, SCR_CONN, SCR_SCAN, SCR_STATS, SCR_SETUP, SCR_COUNT };
 static int g_screen = SCR_AIRSPACE;
 
 // ---- RF scan screen state (2.4 GHz WiFi APs; BLE comes from drone_scan) -----
@@ -96,12 +96,6 @@ static inline float  rangeKm() { return appcfg::kRangePresetsKm[g_range_idx]; }
 
 // ---- unified airspace selection (index into sorted contact list) -----------
 static int           g_airspace_sel  = 0;
-
-// ---- drone feed selection + slide-in animation ----------------------------
-static int           g_drone_sel     = 0;
-static char          g_feed_top_mac[18] = "";
-static float         g_feed_anim     = 0.0f;   // px offset F_ROW_H->0 during slide
-static unsigned long g_feed_anim_t   = 0;
 
 // ---- airspace source health ------------------------------------------------
 static unsigned long g_lastAdsbOkMs    = 0;     // millis() of last successful fetch (0 = never)
@@ -721,58 +715,64 @@ static void drawStatsScreen() {
 }
 
 // ---------------------------------------------------------------------------
-// SURVEILLANCE
+// CONNECTIONS — at-a-glance health of each data channel
 // ---------------------------------------------------------------------------
-static void drawSurveilScreen() {
-  drawTopBar("SURVEILLANCE");
-  surveil::Detection dets[surveil::kMaxDetections];
-  size_t n = surveil::snapshot(dets, surveil::kMaxDetections);
+static void drawConnScreen() {
+  drawTopBar("CONNECTIONS");
 
-  // sort by confidence desc, then rssi desc for ties
-  for (int i = 1; i < (int)n; ++i) {
-    surveil::Detection tmp = dets[i]; int j = i - 1;
-    while (j >= 0 && (dets[j].confidence < tmp.confidence ||
-           (dets[j].confidence == tmp.confidence && dets[j].rssi < tmp.rssi))) {
-      dets[j+1] = dets[j]; --j;
-    }
-    dets[j+1] = tmp;
-  }
+  drone::Drone d[12]; size_t nd = drone::snapshot(d, 12);
+  int cBle = 0;
+  for (size_t i = 0; i < nd; ++i) if (d[i].source == drone::SRC_BLE) ++cBle;
 
-  cv.setTextDatum(top_left);
+  c5link::WifiSight ws[24]; size_t nw = c5link::wifiSnapshot(ws, 24);
+  int w24 = 0, w5 = 0;
+  for (size_t i = 0; i < nw; ++i) { if (ws[i].band == 5) ++w5; else ++w24; }
+
+  bool          c5up = c5link::linked();
+  unsigned long f24  = c5link::frames24();
+  unsigned long f5   = c5link::frames5();
+  bool          wifiUp = (WiFi.status() == WL_CONNECTED);
+  size_t        nAc    = services::adsb::aircraftCount();
+
   cv.setTextSize(1);
-  int y = CONTENT_Y + 2;
+  auto row = [&](int y, const char* name, uint16_t dot, const char* state, const char* val) {
+    cv.fillCircle(12, y + 4, 4, dot);
+    cv.setTextDatum(top_left);
+    cv.setTextColor(COL_TEXT,  COL_BG); cv.drawString(name,  26, y);
+    cv.setTextColor(COL_LABEL, COL_BG); cv.drawString(state, 96, y);
+    cv.setTextDatum(top_right);
+    cv.setTextColor(COL_TEXT,  COL_BG); cv.drawString(val, W - 8, y);
+  };
 
-  if (n == 0) {
-    cv.setTextColor(COL_LABEL, COL_BG);
-    cv.drawString("PASSIVE DETECT", 8, y); y += 13;
-    cv.setTextColor(COL_HEAD, COL_BG); cv.setTextSize(2);
-    cv.drawString("--", 8, y); y += 20;
-    cv.setTextSize(1); cv.setTextColor(COL_TEXT, COL_BG);
-    cv.drawString("listening...", 8, y);
-  } else {
-    for (size_t i = 0; i < n && y + 12 <= H - BOTBAR_H; ++i) {
-      const surveil::Detection& d = dets[i];
-      uint16_t col = d.confidence >= 70 ? COL_BAD :
-                     d.confidence >= 40 ? COL_HEAD : COL_LABEL;
-      cv.setTextColor(col, COL_BG);
-      char row[28];
-      snprintf(row, sizeof(row), "%-14s %3d%%", d.label, (int)d.confidence);
-      cv.drawString(row, 8, y); y += 12;
-      cv.setTextColor(COL_LABEL, COL_BG);
-      snprintf(row, sizeof(row), "%02X:%02X:%02X  %d dBm",
-               d.mac[0], d.mac[1], d.mac[2], (int)d.rssi);
-      cv.drawString(row, 8, y); y += 12;
-    }
-  }
+  int y = CONTENT_Y + 6; const int dy = 23; char v[12];
 
-  char c1[12]; snprintf(c1, sizeof(c1), "SURV %d", (int)n);
-  drawBottomBar(c1, "--", "RF+BLE");
+  snprintf(v, sizeof(v), "%d", cBle);
+  row(y, "BLE", g_bleScanRunning ? COL_OK : COL_BAD,
+      g_bleScanRunning ? "scanning" : "off", v); y += dy;
+
+  snprintf(v, sizeof(v), "%dap", w24);
+  row(y, "2.4 GHz", (c5up && f24 > 0) ? COL_OK : (c5up ? COL_HEAD : COL_BAD),
+      c5up ? "C5 wifi" : "no link", v); y += dy;
+
+  snprintf(v, sizeof(v), "%dap", w5);
+  row(y, "5 GHz", (c5up && f5 > 0) ? COL_OK : (c5up ? COL_HEAD : COL_BAD),
+      c5up ? "C5 wifi" : "no link", v); y += dy;
+
+  snprintf(v, sizeof(v), "%dac", (int)nAc);
+  row(y, "SKY", (wifiUp && nAc > 0) ? COL_OK : (wifiUp ? COL_HEAD : COL_BAD),
+      wifiUp ? "online" : "offline", v);
+
+  char cBat[10]; snprintf(cBat, sizeof(cBat), "%d%%", battPctFromMv(M5.Power.getBatteryVoltage()));
+  char cC5[12]; unsigned long lb = c5link::lastByteMs();
+  if (lb) snprintf(cC5, sizeof(cC5), "C5 %lus", (millis() - lb) / 1000);
+  else    snprintf(cC5, sizeof(cC5), "C5 --");
+  drawBottomBar(cBat, cC5, "LINKS");
 }
 
 // ---------------------------------------------------------------------------
 // RF SCAN — lilac feed: WiFi 2.4 GHz (native) + BLE + 5 GHz (via C5), newest first
 // ---------------------------------------------------------------------------
-static void drawSrcBadge(int x, int y, uint8_t src);   // defined after drawDroneFeed
+static void drawSrcBadge(int x, int y, uint8_t src);   // forward decl; defined below
 
 static char          g_scan_top_mac[18] = "";
 static float         g_scan_anim   = 0.0f;
@@ -932,8 +932,6 @@ static void drawSetupScreen() {
 }
 
 // ---------------------------------------------------------------------------
-// DRONES FEED
-// ---------------------------------------------------------------------------
 static void drawSrcBadge(int x, int y, uint8_t src) {
   const char* lbl; uint16_t fill = 0, stroke = 0, txt;
   switch (src) {
@@ -949,119 +947,12 @@ static void drawSrcBadge(int x, int y, uint8_t src) {
   cv.drawString(lbl, x + 12, y + 7);
 }
 
-static void drawDroneFeed() {
-  cv.fillRect(0, 0, W, H, F_BG);
-
-  drone::Drone arr[12];
-  size_t n = drone::snapshot(arr, 12);
-
-  // sort: newest first
-  int order[12];
-  for (size_t i = 0; i < n; ++i) order[i] = (int)i;
-  for (size_t i = 1; i < n; ++i) {
-    int k = order[i]; int j = (int)i - 1;
-    while (j >= 0 && arr[order[j]].last_seen_ms < arr[k].last_seen_ms) { order[j+1] = order[j]; --j; }
-    order[j+1] = k;
-  }
-
-  int cBle = 0, c24 = 0, c5 = 0;
-  for (size_t i = 0; i < n; ++i)
-    switch (arr[i].source) {
-      case drone::SRC_WIFI_5G: ++c5;  break;
-      case drone::SRC_WIFI_2G: ++c24; break;
-      default:                 ++cBle; break;
-    }
-
-  // --- slim top bar: live dot + label + source tally ---
-  if (((millis() / 550) % 2) == 0) cv.fillCircle(9, 11, 2, F_ACCENT);
-  else                              cv.drawCircle(9, 11, 2, F_DIM);
-  cv.setTextSize(1);
-  cv.setTextDatum(middle_left);  cv.setTextColor(F_DIM, F_BG); cv.drawString("remote id", 17, 11);
-  char tb[12];
-  cv.setTextDatum(middle_right);
-  cv.setTextColor(F_DIM,    F_BG); snprintf(tb, sizeof(tb), "ble %d", cBle); cv.drawString(tb, 166, 11);
-  cv.setTextColor(F_DIM,    F_BG); snprintf(tb, sizeof(tb), "2.4 %d", c24);  cv.drawString(tb, 200, 11);
-  cv.setTextColor(F_ACCENT, F_BG); snprintf(tb, sizeof(tb), "5g %d",  c5);   cv.drawString(tb, 232, 11);
-  cv.drawFastHLine(0, 22, W, F_HAIR);
-
-  if (n == 0) {
-    cv.setTextDatum(top_left); cv.setTextColor(F_DIM, F_BG); cv.setTextSize(1);
-    cv.drawString("watching ble + wifi...", 8, F_TOP + 18);
-    return;
-  }
-
-  // --- new arrival at top -> kick off the slide ---
-  if (strncmp(arr[order[0]].mac, g_feed_top_mac, 17) != 0) {
-    strncpy(g_feed_top_mac, arr[order[0]].mac, 17); g_feed_top_mac[17] = '\0';
-    g_feed_anim   = (float)F_ROW_H;
-    g_feed_anim_t = millis();
-  }
-  if (g_feed_anim > 0.0f) {
-    unsigned long now = millis();
-    g_feed_anim -= (float)(now - g_feed_anim_t) * F_ROW_H / 300.0f;
-    g_feed_anim_t = now;
-    if (g_feed_anim < 0.0f) g_feed_anim = 0.0f;
-  }
-  int off = (int)(g_feed_anim + 0.5f);
-
-  if (g_drone_sel >= (int)n) g_drone_sel = (int)n - 1;
-  if (g_drone_sel < 0)       g_drone_sel = 0;
-
-  // --- rows clipped to the feed window so slide enters/exits cleanly ---
-  cv.setClipRect(0, F_TOP, W, F_WIN_H);
-  for (size_t i = 0; i < n; ++i) {
-    int y = F_TOP + (int)i * F_ROW_H - off;
-    if (y >= 135 || y + F_ROW_H <= F_TOP) continue;
-    const drone::Drone& d = arr[order[i]];
-    bool sel = ((int)i == g_drone_sel);
-    uint16_t bg = sel ? F_SELROW : F_BG;
-
-    if (sel) {
-      cv.fillRect(4, y, 232, F_ROW_H, F_SELROW);
-      cv.fillRect(4, y, 2, F_ROW_H, F_ACCENT);
-    }
-
-    drawSrcBadge(8, y + 4, d.source);
-
-    cv.setTextSize(1);
-    cv.setTextDatum(middle_left); cv.setTextColor(F_TEXT, bg);
-    cv.drawString(d.id[0] ? d.id : "drone", 40, y + 11);
-
-    char meta[20];
-    if (sel && d.has_op) {
-      float pk = haversineKm(g_cfg.lat, g_cfg.lon, d.op_lat, d.op_lon);
-      if (pk < 1.0f) snprintf(meta, sizeof(meta), "pilot %dm",    (int)lroundf(pk * 1000));
-      else           snprintf(meta, sizeof(meta), "pilot %.1fkm", pk);
-      cv.setTextDatum(middle_left); cv.setTextColor(F_ACCENT, bg);
-      cv.drawString(meta, 100, y + 11);
-    } else {
-      snprintf(meta, sizeof(meta), "%d", d.rssi);
-      cv.setTextDatum(middle_right); cv.setTextColor(F_DIM, bg);
-      cv.drawString(meta, 186, y + 11);
-    }
-
-    cv.setTextDatum(middle_right); cv.setTextColor(F_TEXT, bg);
-    if (d.has_loc) {
-      float km = haversineKm(g_cfg.lat, g_cfg.lon, d.lat, d.lon);
-      if (km < 1.0f) snprintf(meta, sizeof(meta), "%dm",    (int)lroundf(km * 1000));
-      else           snprintf(meta, sizeof(meta), "%.1fkm", km);
-    } else {
-      snprintf(meta, sizeof(meta), "--");
-    }
-    cv.drawString(meta, 232, y + 11);
-
-    cv.drawFastHLine(8, y + F_ROW_H - 1, 224, F_HAIR);
-  }
-  cv.clearClipRect();
-}
-
 // ---------------------------------------------------------------------------
 static void render() {
   cv.fillScreen(COL_BG);
   switch (g_screen) {
     case SCR_AIRSPACE: drawAirspaceScreen(); break;
-    case SCR_DRONES:   drawDroneFeed(); break;
-    case SCR_SURVEIL:  drawSurveilScreen(); break;
+    case SCR_CONN:     drawConnScreen(); break;
     case SCR_SCAN:     drawScanScreen(); break;
     case SCR_STATS:    drawStatsScreen(); break;
     case SCR_SETUP:    drawSetupScreen(); break;
@@ -1100,36 +991,6 @@ void setup() {
   g_bleScanRunning = true;
 }
 
-static void animateCardFlip(int newRot) {
-  const float cx = W / 2.0f, cy = H / 2.0f;
-  const int   half = 7;        // frames per phase (~14 total)
-  const float zmin = 0.03f;    // how thin the "edge-on" line gets
-  cv.setPivot(W / 2.0f, H / 2.0f);
-
-  auto frame = [&](float angle, float zx) {
-    int bandHalf = (int)ceilf(W * zx * 0.5f) + 1;
-    M5.Display.startWrite();
-    if (bandHalf < (int)cx) {
-      M5.Display.fillRect(0, 0, (int)cx - bandHalf, H, COL_BG);
-      M5.Display.fillRect((int)cx + bandHalf, 0, W - ((int)cx + bandHalf), H, COL_BG);
-    }
-    cv.pushRotateZoom(cx, cy, angle, zx, 1.0f);
-    M5.Display.endWrite();
-  };
-
-  for (int i = 1; i <= half; ++i) {        // squash current view to a line
-    float t = (float)i / half;
-    frame(0.0f, 1.0f - (1.0f - zmin) * (t * t));        // ease-in
-  }
-  for (int i = 0; i <= half; ++i) {        // grow the flipped view back out
-    float t = (float)i / half;
-    frame(180.0f, zmin + (1.0f - zmin) * (t * (2.0f - t)));  // ease-out
-  }
-
-  M5.Display.setRotation(newRot);
-  render();
-}
-
 void loop() {
   M5.update();
   static bool s_c5_up = false;
@@ -1158,7 +1019,6 @@ void loop() {
   // BtnB: click = next item / start portal on SETUP; hold (airspace) = cycle range
   if (M5.BtnB.wasClicked()) {
     if (g_screen == SCR_AIRSPACE)                       ++g_airspace_sel;  // clamped on next render
-    else if (g_screen == SCR_DRONES)                    ++g_drone_sel;     // clamped on next render
     else if (g_screen == SCR_SCAN)                      g_scan_sel = g_scan_sel + 1;  // wrapped on next render
     else if (g_screen == SCR_SETUP && !g_portal_active) startConfigPortal();
     render();
@@ -1206,7 +1066,7 @@ void loop() {
     if (fabsf(h) > 0.5f) {                           // only when clearly landscape
       static int rot = 1;
       int want = (h > 0) ? 1 : 3;                    // swap 1 and 3 if screen ends up upside-down
-      if (want != rot) { rot = want; animateCardFlip(rot); }
+      if (want != rot) { rot = want; M5.Display.setRotation(rot); render(); }
     }
     float mag = sqrtf(ax*ax + ay*ay + az*az);
     if (fabsf(mag - last_mag) > 0.06f) last_motion = now;
@@ -1242,9 +1102,9 @@ void loop() {
     }
   }
 
-  // RF SCAN / SURVEILLANCE screens: async 2.4 GHz AP sweep.
-  // Briefly perturbs the STA link; runs while either screen is active.
-  if (g_screen == SCR_SCAN || g_screen == SCR_SURVEIL) {
+  // RF SCAN screen: async 2.4 GHz AP sweep.
+  // Briefly perturbs the STA link; runs while the screen is active.
+  if (g_screen == SCR_SCAN) {
     if (!g_wifi_scanning && now - g_last_wifi_scan > 5000) {
       WiFi.scanNetworks(true /*async*/, false /*show_hidden*/);
       g_wifi_scanning = true;
@@ -1279,18 +1139,12 @@ void loop() {
   // nudge WiFi back if it drops; not during a scan or portal
   static unsigned long last_recon = 0;
   if (WiFi.status() != WL_CONNECTED && now - last_recon > 10000 &&
-      g_screen != SCR_SCAN && g_screen != SCR_SURVEIL && !g_wifi_scanning && !g_portal_active) {
+      g_screen != SCR_SCAN && !g_wifi_scanning && !g_portal_active) {
     last_recon = now; WiFi.reconnect();
   }
 
   static unsigned long last_idle = 0;
   if (now - last_idle > 1000) { last_idle = now; render(); }
-
-  // Drone feed runs at ~30 fps to keep the slide animation smooth
-  if (g_screen == SCR_DRONES) {
-    static unsigned long last_drone_render = 0;
-    if (now - last_drone_render > 33) { last_drone_render = now; render(); }
-  }
 
   delay(10);
 }

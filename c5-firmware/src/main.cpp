@@ -258,13 +258,14 @@ void setup() {
   LinkSerial.begin(LINK_BAUD, SERIAL_8N1);  // UART0 pads -> StickS3
   delay(200);
 
-  WiFi.mode(WIFI_MODE_NULL);                 // bring up the driver without associating
+  WiFi.mode(WIFI_STA);                        // driver must be running for promiscuous to work
+  WiFi.disconnect();                          // don't associate with anything
   esp_wifi_set_ps(WIFI_PS_NONE);
   esp_wifi_set_country_code("US", true);     // unlock 5 GHz channels (regulatory gate)
   wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
   esp_wifi_set_promiscuous_filter(&filt);
+  esp_wifi_set_promiscuous_rx_cb(&sniffer_cb);  // register callback before enabling
   esp_wifi_set_promiscuous(true);
-  esp_wifi_set_promiscuous_rx_cb(&sniffer_cb);
   hop();  // set first channel/band
 }
 
@@ -300,9 +301,11 @@ void loop() {
   }
 
   static uint32_t last_hb = 0;
-  if (now - last_hb >= HEARTBEAT_MS) {
+  if (now - last_hb >= 1000) {
     last_hb = now;
-    LinkSerial.printf("H|planewatch-c5|%d\n", PROTOCOL_VERSION);
+    LinkSerial.printf("H|planewatch-c5|%d|up=%lu|hop=%u/%u|n24=%lu|n5=%lu\n",
+                      PROTOCOL_VERSION, (unsigned long)(now / 1000),
+                      g_cur_band, g_cur_ch, (unsigned long)g_n24, (unsigned long)g_n5);
   }
 
   // expire slots silent for >30 s

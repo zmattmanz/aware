@@ -2,29 +2,23 @@
 #include "drone_scan.h"
 
 #include <Arduino.h>
+#include <M5Unified.h>          // M5.getPin() — ask the board for its real Grove GPIOs
 #include <cstring>
 #include <cstdlib>
 
-// === DIAGNOSTIC ============================================================
-// 1 = echo every received line + a 1-line status to the USB console (Serial).
-// 0 = silent.
 #define C5_LINK_DEBUG 1
-// ===========================================================================
 
 namespace c5link {
 namespace {
 
-// --- LINK (copied from Plume's working Cardputer config) -------------------
-//   UART1 on Grove G1/G2.  RX = GPIO2 (S3 RX <- C5 TXD).  3.3 V both ends.
-//   Receive-only here, so no TX pin is driven (Plume drives G1; we don't need it).
-//   The C5 MUST have its own power — running it off the StickS3's Grove 5 V
-//   browns out the S3 and causes reset-cycling.
-constexpr int      kRxPin = 2;     // Grove G2 — StickS3 RX <- C5 TXD
-constexpr int      kTxPin = -1;    // unused (link is C5 -> S3 only)
+constexpr int      kRxFallback = 2;
 constexpr uint32_t kBaud  = 115200;
 constexpr uint32_t kHeartbeatTimeoutMs = 8000;
 
-HardwareSerial  SerialC5(1);       // UART1, like Plume's `HardwareSerial SerialC5(1)`
+HardwareSerial  SerialC5(1);       // UART1
+int             s_rxPin     = -1;
+int             s_pin1      = -1;
+int             s_pin2      = -1;
 bool            s_started   = false;
 char            s_line[256];
 size_t          s_len       = 0;
@@ -33,9 +27,10 @@ unsigned long   s_last_byte = 0;
 
 unsigned long s_rx_bytes = 0, s_rx_lines = 0;
 unsigned long s_n_h = 0, s_n_r = 0, s_n_w = 0, s_n_d = 0, s_n_other = 0;
+unsigned long s_hb_n24 = 0, s_hb_n5 = 0;   // 2.4/5 GHz frame counts from the C5 heartbeat
 char          s_last_line[80] = "";
 
-constexpr int kMaxWifi = 12;
+constexpr int kMaxWifi = 24;       // bigger table so 5 GHz APs aren't evicted by the 2.4 flood
 WifiSight s_wifi[kMaxWifi] = {};
 
 void ingestWifi(const char* bssid, const char* ssid, int8_t rssi, uint8_t band) {
@@ -70,7 +65,13 @@ void handleLine(char* line) {
     case 'H': s_n_h++; break;  case 'R': s_n_r++; break;
     case 'W': s_n_w++; break;  case 'D': s_n_d++; break;  default: s_n_other++;
   }
-  if (line[0] == 'H') { s_last_hb = millis(); return; }   // H|planewatch-c5|<ver>
+  if (line[0] == 'H') {                                   // H|planewatch-c5|<ver>[|up=..|hop=../..|n24=..|n5=..]
+    s_last_hb = millis();
+    const char* p;
+    if ((p = strstr(line, "n24=")) != nullptr) s_hb_n24 = strtoul(p + 4, nullptr, 10);
+    if ((p = strstr(line, "n5="))  != nullptr) s_hb_n5  = strtoul(p + 3, nullptr, 10);
+    return;
+  }
   if (line[0] == 'W') {                                   // W|bssid|ssid|rssi|band
     char* t[6]; int n = split(line, t, 6);
     if (n >= 5 && t[1][0]) ingestWifi(t[1], t[2], (int8_t)atoi(t[3]), (uint8_t)atoi(t[4]));
@@ -97,20 +98,21 @@ void handleLine(char* line) {
 
 }  // namespace
 
-// ── Plume's c5_link_begin(), adapted ──────────────────────────────────────
 void begin() {
   if (s_started) return;
-  SerialC5.setRxBufferSize(512);                          // must precede begin()
-  SerialC5.begin(kBaud, SERIAL_8N1, kRxPin, kTxPin);
+  s_pin1 = M5.getPin(m5::pin_name_t::port_a_pin1);   // Grove RX line
+  s_pin2 = M5.getPin(m5::pin_name_t::port_a_pin2);
+  s_rxPin = (s_pin1 >= 0) ? s_pin1 : kRxFallback;
+  SerialC5.setRxBufferSize(512);
+  SerialC5.begin(kBaud, SERIAL_8N1, s_rxPin, -1);
   s_len = 0;
   s_started = true;
 #if C5_LINK_DEBUG
-  Serial.printf("[c5] link up: UART1 rx=%d tx=%d @%lu (Grove)\n",
-                kRxPin, kTxPin, (unsigned long)kBaud);
+  Serial.printf("[c5] Grove port_a pin1=%d pin2=%d -> using RX=%d @%lu\n",
+                s_pin1, s_pin2, s_rxPin, (unsigned long)kBaud);
 #endif
 }
 
-// ── Plume's process_c5_serial(), with a byte budget so a flood can't stall ──
 void poll() {
   if (!s_started) return;
   int budget = 1024;
@@ -130,12 +132,14 @@ void poll() {
 
 bool          linked()     { return s_last_hb != 0 && (millis() - s_last_hb) < kHeartbeatTimeoutMs; }
 unsigned long lastByteMs() { return s_last_byte; }
+unsigned long frames24()   { return s_hb_n24; }   // cumulative 2.4 GHz frames the C5 has captured
+unsigned long frames5()    { return s_hb_n5;  }   // cumulative 5 GHz frames the C5 has captured
 
 void diag(char* out, size_t n) {
   unsigned long age = s_last_byte ? (millis() - s_last_byte) : 0;
   snprintf(out, n,
-    "rxpin=%d rx=%luB lines=%lu H=%lu W=%lu R=%lu ?=%lu age=%lums last=\"%s\"",
-    kRxPin, s_rx_bytes, s_rx_lines, s_n_h, s_n_w, s_n_r, s_n_other, age, s_last_line);
+    "rx=%d(p1=%d,p2=%d) bytes=%luB H=%lu W=%lu R=%lu n24=%lu n5=%lu age=%lums last=\"%s\"",
+    s_rxPin, s_pin1, s_pin2, s_rx_bytes, s_n_h, s_n_w, s_n_r, s_hb_n24, s_hb_n5, age, s_last_line);
 }
 
 size_t wifiSnapshot(WifiSight* out, size_t max) {

@@ -8,7 +8,9 @@ namespace c5link {
 void          begin();        // open the UART link from the C5 (call once, from loop — NOT setup)
 void          poll();         // call every loop(): drains UART, parses, feeds table
 bool          linked();       // true if a C5 heartbeat arrived within the last 8 s
-unsigned long lastByteMs();   // millis() of last byte received (0 = never) — diagnostics
+unsigned long lastByteMs();   // millis() of last byte received (0 = never)
+unsigned long frames24();     // C5's cumulative 2.4 GHz frame count (from heartbeat)
+unsigned long frames5();      // C5's cumulative 5 GHz frame count (from heartbeat)
 
 // WiFi beacon sightings reported by the C5 (W| lines)
 struct WifiSight {
@@ -18,7 +20,7 @@ struct WifiSight {
   uint8_t       band;          // 24 = 2.4 GHz, 5 = 5 GHz
   unsigned long last_seen;
 };
-size_t wifiSnapshot(WifiSight* out, size_t max);  // non-stale C5 APs -> count
-void   diag(char* out, size_t n);                 // one-line link status for Serial debug
+size_t wifiSnapshot(WifiSight* out, size_t max);
+void   diag(char* out, size_t n);
 
 }  // namespace c5link
