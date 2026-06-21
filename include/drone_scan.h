@@ -9,7 +9,8 @@
 
 namespace drone {
 
-enum DroneSource : uint8_t { SRC_BLE = 0, SRC_WIFI_2G = 1, SRC_WIFI_5G = 2 };
+enum DroneSource  : uint8_t { SRC_BLE = 0, SRC_WIFI_2G = 1, SRC_WIFI_5G = 2 };
+enum TrackerType  : uint8_t { TRK_NONE = 0, TRK_AIRTAG, TRK_TILE, TRK_SMARTTAG };
 
 struct Drone {
   char          mac[18];
@@ -39,12 +40,16 @@ void ingestC5(const char* mac, const char* id, int8_t rssi, uint8_t band,
 // for the live RF-scan screen.
 struct BleSight {
   char          mac[18];
-  char          name[20];      // empty if the device advertises no name
+  char          name[20];
   int8_t        rssi;
-  uint16_t      company_id;    // BLE SIG company ID from manufacturer data (0 if none)
-  bool          has_mfr;       // true if the advert carried manufacturer data
+  uint16_t      company_id;
+  bool          has_mfr;
+  uint8_t       tracker;           // TrackerType — TRK_NONE if not a known tracker
+  unsigned long first_seen_ms;     // when this MAC was first logged (stable within a rotation window)
   unsigned long last_seen_ms;
 };
-size_t bleSnapshot(BleSight* out, size_t max);  // recent BLE devices -> count
+size_t bleSnapshot(BleSight* out, size_t max);
+size_t bleCount();      // total recent BLE devices (any kind)
+size_t trackerCount();  // recent devices classified as a known tracker
 
 }  // namespace drone

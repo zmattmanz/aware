@@ -1,5 +1,4 @@
 #include "drone_scan.h"
-#include "surveil_scan.h"
 
 #include <Arduino.h>
 #include <NimBLEDevice.h>
@@ -29,6 +28,8 @@ struct BleEntry {
   int8_t        rssi;
   uint16_t      company_id;
   bool          has_mfr;
+  uint8_t       tracker;       // TrackerType
+  unsigned long first_seen;    // set once on new entry; stable within a MAC rotation window
   unsigned long last_seen;
 };
 BleEntry s_ble[kMaxBle];
@@ -89,20 +90,30 @@ class ScanCb : public NimBLEScanCallbacks {
       }
       int bi = (hit >= 0) ? hit : ((fi >= 0) ? fi : oi);
       BleEntry& be = s_ble[bi];
-      if (hit < 0) { memset(&be, 0, sizeof(be)); be.used = true; strncpy(be.mac, m, 17); be.mac[17] = '\0'; }
+      if (hit < 0) {
+        memset(&be, 0, sizeof(be)); be.used = true;
+        strncpy(be.mac, m, 17); be.mac[17] = '\0';
+        be.first_seen = millis();
+      }
       if (!nm.empty()) { strncpy(be.name, nm.c_str(), sizeof(be.name) - 1); be.name[sizeof(be.name) - 1] = '\0'; }
       be.rssi       = (int8_t)dev->getRSSI();
       be.company_id = cid;
       be.has_mfr    = hasMfr;
       be.last_seen  = millis();
+
+      // Tracker classification
+      uint8_t trk = TRK_NONE;
+      if (hasMfr && cid == 0x004C && mfr.size() >= 3 && (uint8_t)mfr[2] == 0x12)
+        trk = TRK_AIRTAG;
+      else if (dev->isAdvertisingService(NimBLEUUID((uint16_t)0xFEED)))
+        trk = TRK_TILE;
+      else if (dev->isAdvertisingService(NimBLEUUID((uint16_t)0xFD5A)))
+        trk = TRK_SMARTTAG;
+      be.tracker = trk;
+
       if (s_lock) xSemaphoreGive(s_lock);
 
-      // feed surveillance detector (OUI + name + company-ID matching)
-      uint8_t mac6[6];
-      sscanf(m, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-             &mac6[0], &mac6[1], &mac6[2], &mac6[3], &mac6[4], &mac6[5]);
-      surveil::ingestBle(nm.empty() ? nullptr : nm.c_str(), mac6,
-                         (int8_t)dev->getRSSI(), cid, hasMfr);
+
     }
 
     NimBLEUUID astm((uint16_t)kAstmUuid);
@@ -225,12 +236,32 @@ size_t bleSnapshot(BleSight* out, size_t max) {
     BleSight& b = out[n];
     strncpy(b.mac, s_ble[i].mac, sizeof(b.mac));
     strncpy(b.name, s_ble[i].name, sizeof(b.name));
-    b.rssi         = s_ble[i].rssi;
-    b.company_id   = s_ble[i].company_id;
-    b.has_mfr      = s_ble[i].has_mfr;
-    b.last_seen_ms = s_ble[i].last_seen;
+    b.rssi          = s_ble[i].rssi;
+    b.company_id    = s_ble[i].company_id;
+    b.has_mfr       = s_ble[i].has_mfr;
+    b.tracker       = s_ble[i].tracker;
+    b.first_seen_ms = s_ble[i].first_seen;
+    b.last_seen_ms  = s_ble[i].last_seen;
     ++n;
   }
+  if (s_lock) xSemaphoreGive(s_lock);
+  return n;
+}
+
+size_t bleCount() {
+  size_t n = 0; unsigned long now = millis();
+  if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY);
+  for (int i = 0; i < kMaxBle; ++i)
+    if (s_ble[i].used && now - s_ble[i].last_seen < 30000) ++n;
+  if (s_lock) xSemaphoreGive(s_lock);
+  return n;
+}
+
+size_t trackerCount() {
+  size_t n = 0; unsigned long now = millis();
+  if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY);
+  for (int i = 0; i < kMaxBle; ++i)
+    if (s_ble[i].used && s_ble[i].tracker != TRK_NONE && now - s_ble[i].last_seen < 30000) ++n;
   if (s_lock) xSemaphoreGive(s_lock);
   return n;
 }

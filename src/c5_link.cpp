@@ -27,7 +27,7 @@ unsigned long   s_last_hb = 0, s_last_byte = 0;
 
 unsigned long s_rx_bytes = 0, s_rx_lines = 0;
 unsigned long s_n_h = 0, s_n_r = 0, s_n_w = 0, s_n_d = 0, s_n_other = 0;
-unsigned long s_hb_n24 = 0, s_hb_n5 = 0;
+unsigned long s_hb_n24 = 0, s_hb_n5 = 0, s_hb_cl = 0;
 char          s_last_line[80] = "";
 
 constexpr int kMaxWifi = 24;
@@ -76,6 +76,7 @@ void handleLine(char* line) {
     const char* p;
     if ((p = strstr(line, "n24=")) != nullptr) s_hb_n24 = strtoul(p + 4, nullptr, 10);
     if ((p = strstr(line, "n5="))  != nullptr) s_hb_n5  = strtoul(p + 3, nullptr, 10);
+    if ((p = strstr(line, "cl="))  != nullptr) s_hb_cl  = strtoul(p + 3, nullptr, 10);
     return;
   }
   if (line[0] == 'W') {
@@ -143,6 +144,7 @@ bool          linked()     { return s_last_hb != 0 && (millis() - s_last_hb) < k
 unsigned long lastByteMs() { return s_last_byte; }
 unsigned long frames24()   { return s_hb_n24; }
 unsigned long frames5()    { return s_hb_n5; }
+unsigned long clients()    { return s_hb_cl; }
 int           rxPin()      { return s_curRx; }       // pin it's currently listening on
 unsigned long rxBytes()    { return s_rx_bytes; }    // total bytes received (>0 = wire is good)
 

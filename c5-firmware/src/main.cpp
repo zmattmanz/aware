@@ -98,6 +98,35 @@ static void store(const uint8_t* mac, const ODID_UAS_Data* tmp, int8_t rssi, uin
   portEXIT_CRITICAL(&s_mux);
 }
 
+// ---- nearby client tracking (probe requests) -------------------------------
+struct ProbeEntry { uint8_t mac[6]; uint32_t last_seen; };
+static const int kMaxClients = 96;
+static ProbeEntry s_clients[kMaxClients];
+static portMUX_TYPE s_cl_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void note_client(const uint8_t* mac) {
+  uint32_t now = millis();
+  portENTER_CRITICAL(&s_cl_mux);
+  int idx = -1, oldest = 0; uint32_t oldest_t = 0xFFFFFFFFUL;
+  for (int i = 0; i < kMaxClients; ++i) {
+    if (memcmp(s_clients[i].mac, mac, 6) == 0) { idx = i; break; }
+    if (s_clients[i].last_seen < oldest_t) { oldest_t = s_clients[i].last_seen; oldest = i; }
+  }
+  if (idx < 0) idx = oldest;
+  memcpy(s_clients[idx].mac, mac, 6);
+  s_clients[idx].last_seen = now;
+  portEXIT_CRITICAL(&s_cl_mux);
+}
+
+static int client_count(uint32_t window_ms) {
+  uint32_t now = millis(); int n = 0;
+  portENTER_CRITICAL(&s_cl_mux);
+  for (int i = 0; i < kMaxClients; ++i)
+    if (s_clients[i].last_seen && (now - s_clients[i].last_seen) < window_ms) ++n;
+  portEXIT_CRITICAL(&s_cl_mux);
+  return n;
+}
+
 // ---- WiFi AP slot table (every beacon, not just drones) --------------------
 struct WSlot {
   bool     used;
@@ -206,6 +235,9 @@ static void sniffer_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
     if (!beacon_odid_payload(f, len, &pack, &plen)) return;
     decodeOpenDroneID(&tmp, pack);
     store(f + 10, &tmp, rssi, band);
+  } else if (subtype == 4) {  // probe request -> nearby client device
+    note_client(f + 10);      // addr2 = source MAC
+    return;
   } else if (subtype == 13) {  // action frame -> try NaN
     char mac[6];
     int r = odid_wifi_receive_message_pack_nan_action_frame(&tmp, mac, f, (size_t)len);
@@ -303,9 +335,10 @@ void loop() {
   static uint32_t last_hb = 0;
   if (now - last_hb >= 1000) {
     last_hb = now;
-    LinkSerial.printf("H|planewatch-c5|%d|up=%lu|hop=%u/%u|n24=%lu|n5=%lu\n",
+    LinkSerial.printf("H|planewatch-c5|%d|up=%lu|hop=%u/%u|n24=%lu|n5=%lu|cl=%d\n",
                       PROTOCOL_VERSION, (unsigned long)(now / 1000),
-                      g_cur_band, g_cur_ch, (unsigned long)g_n24, (unsigned long)g_n5);
+                      g_cur_band, g_cur_ch, (unsigned long)g_n24, (unsigned long)g_n5,
+                      client_count(60000));
   }
 
   // expire slots silent for >30 s

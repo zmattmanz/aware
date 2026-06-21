@@ -1,10 +1,14 @@
 #include "services/adsb_client.h"
 
 #include <HTTPClient.h>
+#include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include <ArduinoJson.h>
 
+#include <climits>
 #include <cstring>
 
 #include "config.h"
@@ -18,16 +22,17 @@ constexpr char kApiBase[] = "https://api.adsb.lol/v2/lat/";
 constexpr float kKmPerNm = 1.852f;
 constexpr int kConnectAttemptMs = 200;
 constexpr unsigned long kRequestTimeoutMs = 10000;
+constexpr unsigned long kFetchIntervalMs  = 4000;
 
-Aircraft s_aircraft[kMaxAircraft];
-size_t s_aircraft_count = 0;
-PollFn s_poll_fn = nullptr;
+Aircraft               s_buf[2][kMaxAircraft];
+size_t                 s_cnt[2]       = {0, 0};
+volatile int           s_front        = 0;
+volatile bool          s_have_center  = false;
+double                 s_lat = 0, s_lon = 0;
+float                  s_radius_km    = 0;
+volatile unsigned long s_last_ok_ms   = 0;
 
-void pollNetwork() {
-  if (s_poll_fn != nullptr) {
-    s_poll_fn();
-  }
-}
+void pollNetwork() {}   // no-op: fetch runs in its own task now
 
 int performGetWithPoll(HTTPClient& http) {
   http.setConnectTimeout(kConnectAttemptMs);
@@ -161,11 +166,13 @@ void fillTagFields(Aircraft* ac, const JsonObject& plane) {
 
 }  // namespace
 
-void setPollFn(PollFn fn) { s_poll_fn = fn; }
+size_t          aircraftCount() { return s_cnt[s_front]; }
+const Aircraft* aircraftList()  { return s_buf[s_front]; }
+unsigned long   lastOkMs()      { return s_last_ok_ms; }
 
-size_t aircraftCount() { return s_aircraft_count; }
-
-const Aircraft* aircraftList() { return s_aircraft; }
+void setCenter(double lat, double lon, float radius_km) {
+  s_lat = lat; s_lon = lon; s_radius_km = radius_km; s_have_center = true;
+}
 
 bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
   const float dist_nm = kmToNauticalMiles(fetch_radius_km);
@@ -211,6 +218,9 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
   filter["ac"][0]["true_heading"] = true;
   filter["ac"][0]["mag_heading"]  = true;
   filter["ac"][0]["dir"]          = true;
+  filter["ac"][0]["squawk"]       = true;
+  filter["ac"][0]["emergency"]    = true;
+  filter["ac"][0]["dbFlags"]      = true;
 
   // Parse directly from the HTTP stream — no intermediate String copy.
   WiFiClient* stream = http.getStreamPtr();
@@ -225,30 +235,65 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
     return false;
   }
 
-  JsonArray ac = doc["ac"].as<JsonArray>();
-  if (ac.isNull()) {
-    s_aircraft_count = 0;
-    return true;
-  }
-
+  // Write into the back buffer, publish atomically on success.
+  const int back = 1 - s_front;
+  Aircraft* fill = s_buf[back];
   size_t n = 0;
-  for (JsonObject plane : ac) {
-    if (n >= kMaxAircraft) break;
-    if (!plane["lat"].is<float>() || !plane["lon"].is<float>()) continue;
-    if (isOnGround(plane) && !config::kAdsbShowGroundAircraft) continue;
 
-    s_aircraft[n].lat       = plane["lat"].as<float>();
-    s_aircraft[n].lon       = plane["lon"].as<float>();
-    s_aircraft[n].nose_deg  = pickNoseHeading(plane);
-    s_aircraft[n].track_deg = pickTrackHeading(plane);
-    s_aircraft[n].gs_knots  = pickGroundSpeed(plane);
-    fillTagFields(&s_aircraft[n], plane);
-    ++n;
+  JsonArray ac = doc["ac"].as<JsonArray>();
+  if (!ac.isNull()) {
+    for (JsonObject plane : ac) {
+      if (n >= kMaxAircraft) break;
+      if (!plane["lat"].is<float>() || !plane["lon"].is<float>()) continue;
+      if (isOnGround(plane) && !config::kAdsbShowGroundAircraft) continue;
+
+      fill[n].lat       = plane["lat"].as<float>();
+      fill[n].lon       = plane["lon"].as<float>();
+      fill[n].nose_deg  = pickNoseHeading(plane);
+      fill[n].track_deg = pickTrackHeading(plane);
+      fill[n].gs_knots  = pickGroundSpeed(plane);
+      fillTagFields(&fill[n], plane);
+
+      copyJsonStringTrimmed(plane, "squawk", fill[n].squawk, sizeof(fill[n].squawk));
+
+      float altf = 0.0f;
+      fill[n].alt_ft = (readJsonFloat(plane, "alt_baro", &altf) ||
+                        readJsonFloat(plane, "alt_geom", &altf))
+                       ? (int)lroundf(altf) : INT_MIN;
+
+      float flags = 0.0f;
+      fill[n].mil = readJsonFloat(plane, "dbFlags", &flags) && ((int)flags & 1);
+
+      const char* sq = fill[n].squawk;
+      bool emSquawk = sq[0] && (!strcmp(sq, "7500") || !strcmp(sq, "7600") || !strcmp(sq, "7700"));
+      bool emField  = false;
+      if (plane["emergency"].is<const char*>()) {
+        const char* e = plane["emergency"].as<const char*>();
+        emField = e && e[0] && strcmp(e, "none") != 0;
+      }
+      fill[n].emergency = emSquawk || emField;
+
+      ++n;
+    }
   }
 
-  s_aircraft_count = n;
+  s_cnt[back] = n;
+  s_front = back;          // atomic publish — UI now reads the new buffer
+  s_last_ok_ms = millis();
   Serial.printf("adsb: %u aircraft\n", static_cast<unsigned>(n));
   return true;
+}
+
+static void adsbTask(void*) {
+  for (;;) {
+    if (s_have_center && WiFi.status() == WL_CONNECTED)
+      fetchUpdate(s_lat, s_lon, s_radius_km);
+    vTaskDelay(pdMS_TO_TICKS(kFetchIntervalMs));
+  }
+}
+
+void begin() {
+  xTaskCreatePinnedToCore(adsbTask, "adsb", 16384, nullptr, 1, nullptr, 0);
 }
 
 }  // namespace services::adsb

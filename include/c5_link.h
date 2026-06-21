@@ -9,6 +9,7 @@ bool          linked();       // true if a C5 heartbeat arrived within the last 
 unsigned long lastByteMs();
 unsigned long frames24();     // C5's 2.4 GHz frame count (from heartbeat)
 unsigned long frames5();      // C5's 5 GHz frame count (from heartbeat)
+unsigned long clients();      // distinct probe-request MACs seen in last 60 s (RF busyness)
 int           rxPin();        // Grove GPIO currently being listened on
 unsigned long rxBytes();      // total bytes received (>0 means the wire is good)
 
