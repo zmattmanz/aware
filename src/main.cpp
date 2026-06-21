@@ -75,9 +75,9 @@ static M5Canvas cv(&M5.Display);
 
 // Font switch helpers — swap cv.unloadFont() for cv.loadFont(pjs_xxx) once VLW data is in include/fonts/
 // Spaces in setTextSize( N ) are intentional: prevent replace_all from matching these lines
-static inline void fontSmall() { cv.unloadFont(); cv.setTextSize( 1 ); }  // labels / values
-static inline void fontBody () { cv.unloadFont(); cv.setTextSize( 2 ); }  // names / titles / headers
-static inline void fontNum  () { cv.unloadFont(); cv.setTextSize( 3 ); }  // big numbers
+static inline void fontSmall() { cv.loadFont(pjs_small); cv.setTextSize( 1 ); }  // PJS Medium 12px
+static inline void fontBody () { cv.loadFont(pjs_body);  cv.setTextSize( 1 ); }  // PJS SemiBold 16px
+static inline void fontNum  () { cv.loadFont(pjs_num);   cv.setTextSize( 1 ); }  // PJS Bold 30px
 
 // ---- screens ---------------------------------------------------------------
 enum Screen { SCR_AIRSPACE = 0, SCR_CONN, SCR_SCAN, SCR_BLE, SCR_STATS, SCR_SETUP, SCR_COUNT };
@@ -760,7 +760,6 @@ static void drawStatsScreen() {
 // ---------------------------------------------------------------------------
 static void drawConnScreen() {
   cv.fillRect(0, 0, W, H, BG);
-  drawTopBar("CONNECTIONS");
 
   // ---- data ----
   bool c5up = c5link::linked();
@@ -768,8 +767,6 @@ static void drawConnScreen() {
   int w5 = 0; for (size_t i = 0; i < nw; ++i) if (ws[i].band == 5) ++w5;
   size_t nAc  = services::adsb::aircraftCount();
   bool wifiUp = (WiFi.status() == WL_CONNECTED);
-
-  // live throughput from the C5 wire (rxBytes delta / dt)
   static unsigned long s_lb = 0, s_lt = 0; static float s_kbps = 0;
   { unsigned long nm = millis(), b = c5link::rxBytes();
     if (s_lt && nm > s_lt) { float dt = (nm - s_lt) / 1000.0f;
@@ -777,41 +774,45 @@ static void drawConnScreen() {
     else { s_lb = b; s_lt = nm; } }
   if (s_kbps < 0 || !c5up) s_kbps = 0;
 
-  // ---- hero card (green when linked, neutral when not) ----
-  int hy = 26, hh = 42;
+  // ---- hero (fills from the top, no header) ----
+  int hx = 6, hy = 6, hw = 228, hh = 50;
   uint16_t hbg  = c5up ? MINT : CARD;
   uint16_t hsub = c5up ? rgb565(0xC8,0xE6,0xD4) : MUTE;
-  drawCard(4, hy, 232, hh, hbg, false);
-  cv.fillSmoothCircle(16, hy + 12, 4, c5up ? VERD : COL_BAD);
+  drawCard(hx, hy, hw, hh, hbg, false);
+  cv.fillSmoothCircle(hx + 12, hy + 22, 4, c5up ? VERD : COL_BAD);
   fontBody(); cv.setTextDatum(top_left); cv.setTextColor(FG, hbg);
-  cv.setClipRect(28, hy, 200, hh); cv.drawString("C5 co-processor", 28, hy + 4); cv.clearClipRect();
-  fontSmall(); cv.setTextColor(hsub, hbg); cv.setTextDatum(top_left);
-  cv.drawString(c5up ? "linked - 5 GHz" : "no link", 28, hy + 26);
+  cv.setClipRect(hx + 24, hy, hw - 30, 24);
+  cv.drawString("C5 co-processor", hx + 24, hy + 9);
+  cv.clearClipRect();
   char kb[14];
   if (c5up) snprintf(kb, sizeof(kb), "%.1f KB/s", s_kbps); else snprintf(kb, sizeof(kb), "--");
-  fontBody(); cv.setTextDatum(middle_right); cv.setTextColor(FG, hbg);
-  cv.drawString(kb, W - 12, hy + 28);
+  fontSmall();
+  cv.setTextDatum(top_left);  cv.setTextColor(hsub, hbg);
+  cv.drawString(c5up ? "linked - 5 GHz" : "no link", hx + 24, hy + 32);
+  cv.setTextDatum(top_right); cv.setTextColor(c5up ? FG : MUTE, hbg);
+  cv.drawString(kb, hx + hw - 12, hy + 32);
 
-  // ---- 2x2 tile grid ----
-  auto tile = [&](int x, int y, const char* label, uint16_t dot, const char* val) {
-    drawCard(x, y, 114, 27, CARD, false);
-    cv.fillSmoothCircle(x + 12, y + 13, 4, dot);
-    fontSmall(); cv.setTextDatum(middle_left);
-    cv.setTextColor(FG, CARD);   cv.drawString(label, x + 22, y + 13);
-    cv.setTextDatum(middle_right);
-    cv.setTextColor(MUTE, CARD); cv.drawString(val, x + 114 - 8, y + 13);
+  // ---- 2x2 grid, even gutters, vertically centered ----
+  auto tile = [&](int x, int y, int w, int h, const char* label, uint16_t dot, const char* val) {
+    drawCard(x, y, w, h, CARD, false);
+    int cy = y + h / 2;
+    cv.fillSmoothCircle(x + 13, cy, 4, dot);
+    fontSmall();
+    cv.setTextDatum(middle_left);  cv.setTextColor(FG, CARD);   cv.drawString(label, x + 24, cy);
+    cv.setTextDatum(middle_right); cv.setTextColor(MUTE, CARD); cv.drawString(val, x + w - 10, cy);
   };
-
+  int gh = 31, tw = (hw - 6) / 2;
+  int gy1 = hy + hh + 6, gy2 = gy1 + gh + 5;
+  int x1 = hx, x2 = hx + tw + 6;
   char v[12];
-  int gy = 72, gx2 = 122;
   snprintf(v, sizeof(v), "%d dev", (int)drone::bleCount());
-  tile(4,   gy,      "BLE",     g_bleScanRunning ? VERD : COL_BAD, v);
+  tile(x1, gy1, tw, gh, "BLE",     g_bleScanRunning ? VERD : COL_BAD, v);
   snprintf(v, sizeof(v), "%d ap", g_ap_count);
-  tile(gx2, gy,      "2.4 GHz", (g_ap_count > 0) ? VERD : MUTE,   v);
+  tile(x2, gy1, tw, gh, "2.4 GHz", (g_ap_count > 0) ? VERD : MUTE,    v);
   snprintf(v, sizeof(v), "%d ap", w5);
-  tile(4,   gy + 30, "5 GHz",   c5up ? VERD : COL_BAD,            v);
+  tile(x1, gy2, tw, gh, "5 GHz",   c5up ? VERD : COL_BAD,             v);
   snprintf(v, sizeof(v), "%d ac", (int)nAc);
-  tile(gx2, gy + 30, "ADS-B",   (nAc > 0) ? VERD : (wifiUp ? MUTE : COL_BAD), v);
+  tile(x2, gy2, tw, gh, "ADS-B",   (nAc > 0) ? VERD : (wifiUp ? MUTE : COL_BAD), v);
 }
 
 // ---------------------------------------------------------------------------
