@@ -347,7 +347,7 @@ static void drawTypeBadge(int x, int cy, uint8_t src, bool onSel = false) {
 
 static void drawPillHeader(const char* title, bool liveDot, const char* rightText) {
   int ph = 18, py = 5, px = 6, dot = liveDot ? 9 : 0;
-  fontSmall();
+  fontBody();
   int pw = cv.textWidth(title) + 16 + dot;
   cv.fillSmoothRoundRect(px, py, pw, ph, ph / 2, HEAD_BG);
   if (liveDot) cv.fillSmoothCircle(px + 11, py + ph / 2, 2, MUTE);
@@ -523,7 +523,7 @@ static void drawAirspaceScreen() {
     cv.fillSmoothRoundRect(rx, 5, rw, 18, 9, LILAC);
     cv.setTextColor(HEAD_FG, LILAC); cv.setTextDatum(middle_center);
     cv.setClipRect(rx, 5, rw, 18); cv.drawString(cc, rx + rw / 2, 14); cv.clearClipRect(); }
-  if (g_paused) { fontSmall(); int tr = 6 + cv.textWidth("Airspace") + 16;
+  if (g_paused) { fontBody(); int tr = 6 + cv.textWidth("Airspace") + 16;
     cv.fillRect(tr + 8, 8, 3, 10, LILAC); cv.fillRect(tr + 13, 8, 3, 10, LILAC); }
 
   // ================= RADAR =================
