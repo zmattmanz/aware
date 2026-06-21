@@ -59,7 +59,7 @@ static constexpr uint16_t F_DIM    = C_DIM;
 static constexpr uint16_t F_ACCENT = C_ACCENT;
 static constexpr uint16_t F_HAIR   = C_HAIRLINE;
 static constexpr uint16_t F_SELROW = C_SELROW;
-static constexpr int F_ROW_H = 32;     // taller rows for 2x names (~3-4 visible)
+static constexpr int F_ROW_H = 28;     // single-line rows (name only), ~4 visible
 static constexpr int F_TOP   = 23;
 static constexpr int F_WIN_H = 112;
 
@@ -915,6 +915,26 @@ static void drawBleScreen() {
   drawBottomBar(bat, tc, "BLE");
 }
 
+static uint16_t srcColor(uint8_t src) {
+  switch (src) { case drone::SRC_WIFI_5G: return COL_OK;
+                 case drone::SRC_WIFI_2G: return COL_HEAD;
+                 default:                 return F_ACCENT; }
+}
+
+static void drawRfBadge(int x, int yTop, uint8_t src) {
+  const char* lbl = (src == drone::SRC_WIFI_5G) ? "5G" : (src == drone::SRC_WIFI_2G) ? "2.4" : "BLE";
+  cv.fillRoundRect(x, yTop, 34, 15, 3, srcColor(src));
+  cv.setTextSize(1); cv.setTextDatum(middle_center); cv.setTextColor(F_BG, srcColor(src));
+  cv.drawString(lbl, x + 17, yTop + 8);
+}
+
+static void drawSignalBars(int x, int yBottom, int8_t rssi, uint16_t on) {
+  int lvl = (rssi >= -55) ? 4 : (rssi >= -67) ? 3 : (rssi >= -78) ? 2 : 1;
+  const int h[4] = {4, 7, 10, 13};
+  for (int i = 0; i < 4; ++i)
+    cv.fillRect(x + i * 8, yBottom - h[i], 6, h[i], (i < lvl) ? on : F_HAIR);
+}
+
 static void drawScanScreen() {
   cv.fillRect(0, 0, W, H, F_BG);
 
@@ -977,10 +997,6 @@ static void drawScanScreen() {
     }
   }
 
-  int cBle = 0, c24 = 0, c5 = 0;
-  for (int i = 0; i < nc; ++i)
-    switch (rows[i].src) { case drone::SRC_WIFI_5G: ++c5; break; case drone::SRC_WIFI_2G: ++c24; break; default: ++cBle; }
-
   // sort: newest first-seen arrival at the top
   unsigned long fs[40];
   for (int i = 0; i < nc; ++i) { bool nw2; fs[i] = rfFirstSeen(rows[i].mac, &nw2); }
@@ -990,80 +1006,61 @@ static void drawScanScreen() {
 
   if (!g_paused) { for (int i = 0; i < nc; ++i) g_disp[i] = rows[order[i]]; g_dispN = nc; }
 
-  // top bar
-  if (((millis() / 550) % 2) == 0) cv.fillCircle(9, 11, 2, F_ACCENT); else cv.drawCircle(9, 11, 2, F_DIM);
-  cv.setTextSize(1);
-  cv.setTextDatum(middle_left);  cv.setTextColor(F_DIM, F_BG); cv.drawString("rf scan", 17, 11);
-  char tb[12];
-  cv.setTextColor(F_DIM, F_BG); snprintf(tb, sizeof(tb), "dev %lu", c5link::clients());
-  cv.setTextDatum(middle_left); cv.drawString(tb, 75, 11);
-  cv.setTextDatum(middle_right);
-  cv.setTextColor(F_DIM,    F_BG); snprintf(tb, sizeof(tb), "ble %d", cBle); cv.drawString(tb, 166, 11);
-  cv.setTextColor(F_DIM,    F_BG); snprintf(tb, sizeof(tb), "2.4 %d", c24);  cv.drawString(tb, 200, 11);
-  cv.setTextColor(F_ACCENT, F_BG); snprintf(tb, sizeof(tb), "5g %d",  c5);   cv.drawString(tb, 232, 11);
-  if (g_filter != RF_ALL) {
-    cv.setTextDatum(middle_left); cv.setTextColor(F_ACCENT, F_BG);
-    cv.drawString(filterName(g_filter), 92, 11);
-  }
-  if (g_paused) {
-    cv.setTextDatum(middle_right); cv.setTextColor(F_ACCENT, F_BG);
-    cv.drawString("❙❙ paused", 150, 11);
-  }
-  cv.drawFastHLine(0, 22, W, F_HAIR);
-
+  // ---- feed body (no header; footer drawn at the bottom) ----
   if (nc == 0) {
-    cv.setTextDatum(top_left); cv.setTextColor(F_DIM, F_BG); cv.setTextSize(1);
-    cv.drawString(g_wifi_scanning ? "scanning..." : "watching wifi + ble...", 8, F_TOP + 18);
-    return;
+    cv.setTextDatum(middle_left); cv.setTextColor(F_DIM, F_BG); cv.setTextSize(1);
+    cv.drawString(g_wifi_scanning ? "scanning..." : "watching wifi + ble...", 10, 56);
+  } else {
+    if (!g_paused && strncmp(rows[order[0]].mac, g_scan_top_mac, 17) != 0) {
+      strncpy(g_scan_top_mac, rows[order[0]].mac, 17); g_scan_top_mac[17] = '\0';
+      if (g_scan_view == 0) { g_scan_anim = (float)F_ROW_H; g_scan_anim_t = millis(); }
+    }
+    if (g_scan_anim > 0.0f) {
+      unsigned long now2 = millis();
+      g_scan_anim -= (float)(now2 - g_scan_anim_t) * F_ROW_H / 450.0f; g_scan_anim_t = now2;
+      if (g_scan_anim < 0.0f) g_scan_anim = 0.0f;
+    }
+    int off = (g_scan_view == 0) ? (int)(g_scan_anim + 0.5f) : 0;
+
+    const int kRows = 4;
+    if (g_scan_sel >= nc) g_scan_sel = nc - 1;
+    if (g_scan_sel < 0)   g_scan_sel = 0;
+    if (g_scan_sel < g_scan_view)          g_scan_view = g_scan_sel;
+    if (g_scan_sel >= g_scan_view + kRows) g_scan_view = g_scan_sel - kRows + 1;
+
+    cv.setClipRect(0, 0, W, 118);
+    for (int vis = 0; vis < kRows && (g_scan_view + vis) < nc; ++vis) {
+      int idx = g_scan_view + vis;
+      const RfRow& c = rows[order[idx]];
+      int y  = vis * F_ROW_H - off;
+      int cy = y + F_ROW_H / 2;
+      bool sel = (idx == g_scan_sel);
+      uint16_t bg = sel ? F_SELROW : F_BG;
+      if (sel) { cv.fillRect(0, y, W, F_ROW_H, F_SELROW); cv.fillRect(0, y, 3, F_ROW_H, F_ACCENT); }
+
+      drawSignalBars(8, cy + 6, c.rssi, srcColor(c.src));    // signal bars on the left
+      drawRfBadge(198, cy - 7, c.src);                       // radio-type badge on the far right
+
+      cv.setClipRect(44, 0, 150, 118);                       // name column, clear of the badge
+      cv.setTextSize(1.5f);
+      cv.setTextDatum(middle_left); cv.setTextColor(F_TEXT, bg); cv.drawString(c.id, 44, cy);
+      cv.setTextSize(1);
+      cv.setClipRect(0, 0, W, 118);
+    }
+    cv.clearClipRect();
   }
 
-  // slide when a new MAC reaches the top (only while not scrolled down and not paused)
-  if (!g_paused && strncmp(rows[order[0]].mac, g_scan_top_mac, 17) != 0) {
-    strncpy(g_scan_top_mac, rows[order[0]].mac, 17); g_scan_top_mac[17] = '\0';
-    // only start a glide when one isn't already running — bursts don't jerk it back to full offset
-    if (g_scan_view == 0 && g_scan_anim <= 0.0f) { g_scan_anim = (float)F_ROW_H; g_scan_anim_t = millis(); }
+  // ---- footer: filter (or paused) on the left, device count on the right ----
+  cv.drawFastHLine(0, 118, W, F_HAIR);
+  cv.setTextSize(1);
+  if (g_paused) {
+    cv.setTextDatum(middle_left); cv.setTextColor(F_ACCENT, F_BG); cv.drawString("❙❙ paused", 8, 127);
+  } else {
+    cv.fillTriangle(8, 123, 15, 123, 11, 128, F_DIM);
+    cv.setTextDatum(middle_left); cv.setTextColor(F_ACCENT, F_BG); cv.drawString(filterName(g_filter), 20, 127);
   }
-  if (g_scan_anim > 0.0f) {
-    unsigned long now2 = millis();
-    float dt = (float)(now2 - g_scan_anim_t); g_scan_anim_t = now2;
-    g_scan_anim *= expf(-dt / 180.0f);          // eased glide; larger divisor = slower & smoother
-    if (g_scan_anim < 0.5f) g_scan_anim = 0.0f;  // snap home
-  }
-  int off = (g_scan_view == 0) ? (int)(g_scan_anim + 0.5f) : 0;
-
-  // clamp + scroll window
-  if (g_scan_sel >= nc) g_scan_sel = nc - 1;
-  if (g_scan_sel < 0)   g_scan_sel = 0;
-  const int kVis = 3;
-  if (g_scan_sel < g_scan_view)         g_scan_view = g_scan_sel;
-  if (g_scan_sel >= g_scan_view + kVis) g_scan_view = g_scan_sel - kVis + 1;
-
-  cv.setClipRect(0, F_TOP, W, F_WIN_H);
-  for (int vis = 0; vis <= kVis && (g_scan_view + vis) < nc; ++vis) {
-    int idx = g_scan_view + vis;
-    const RfRow& c = rows[order[idx]];
-    int y  = F_TOP + vis * F_ROW_H - off;
-    int cy = y + F_ROW_H / 2;
-    bool sel = (idx == g_scan_sel);
-    uint16_t bg = sel ? F_SELROW : F_BG;
-    if (sel) { cv.fillRect(4, y, 232, F_ROW_H, F_SELROW); cv.fillRect(4, y, 2, F_ROW_H, F_ACCENT); }
-    drawSrcBadge(8, y + (F_ROW_H - 14) / 2, c.src);
-
-    // signal word, color-coded by strength
-    const char* sw  = signalWord(c.rssi);
-    uint16_t    swc = (c.rssi >= -60) ? F_ACCENT : (c.rssi >= -75) ? F_TEXT : F_DIM;
-    cv.setTextSize(1);
-    cv.setTextDatum(middle_right); cv.setTextColor(swc, bg); cv.drawString(sw, 232, cy);
-
-    // name at 2x, clipped so long names don't run under the signal word
-    cv.setClipRect(44, F_TOP, 128, F_WIN_H);
-    cv.setTextSize(2);
-    cv.setTextDatum(middle_left); cv.setTextColor(F_TEXT, bg); cv.drawString(c.id, 44, cy);
-    cv.setClipRect(0, F_TOP, W, F_WIN_H);
-
-    cv.drawFastHLine(8, y + F_ROW_H - 1, 224, F_HAIR);
-  }
-  cv.clearClipRect();
+  char fc[16]; snprintf(fc, sizeof(fc), "%d devices", nc);
+  cv.setTextDatum(middle_right); cv.setTextColor(F_DIM, F_BG); cv.drawString(fc, 232, 127);
 }
 
 // ---------------------------------------------------------------------------
