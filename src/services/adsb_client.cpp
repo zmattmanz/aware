@@ -20,7 +20,7 @@ namespace {
 // adsb.lol is an open ADSBexchange-v2 mirror; same JSON shape, no feeder gate.
 constexpr char kApiBase[] = "https://api.adsb.lol/v2/lat/";
 constexpr float kKmPerNm = 1.852f;
-constexpr int kConnectAttemptMs = 200;
+constexpr int kConnectAttemptMs = 6000;   // TLS handshake needs >200 ms; was failing every time
 constexpr unsigned long kRequestTimeoutMs = 10000;
 constexpr unsigned long kFetchIntervalMs  = 4000;
 
@@ -36,20 +36,7 @@ void pollNetwork() {}   // no-op: fetch runs in its own task now
 
 int performGetWithPoll(HTTPClient& http) {
   http.setConnectTimeout(kConnectAttemptMs);
-  const unsigned long deadline = millis() + kRequestTimeoutMs;
-  while (millis() < deadline) {
-    pollNetwork();
-    const int code = http.GET();
-    if (code > 0) {
-      return code;
-    }
-    if (code != HTTPC_ERROR_CONNECTION_REFUSED &&
-        code != HTTPC_ERROR_NOT_CONNECTED) {
-      return code;
-    }
-    delay(5);
-  }
-  return HTTPC_ERROR_READ_TIMEOUT;
+  return http.GET();                 // one attempt; task's 4 s vTaskDelay is the retry backoff
 }
 
 float kmToNauticalMiles(float km) { return km / kKmPerNm; }

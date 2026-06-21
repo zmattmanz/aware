@@ -59,7 +59,7 @@ static constexpr uint16_t F_DIM    = C_DIM;
 static constexpr uint16_t F_ACCENT = C_ACCENT;
 static constexpr uint16_t F_HAIR   = C_HAIRLINE;
 static constexpr uint16_t F_SELROW = C_SELROW;
-static constexpr int F_ROW_H = 22;
+static constexpr int F_ROW_H = 32;     // taller rows for 2x names (~3-4 visible)
 static constexpr int F_TOP   = 23;
 static constexpr int F_WIN_H = 112;
 
@@ -88,9 +88,19 @@ static const char* screenName(int s) {
   }
 }
 
+static int           g_scan_sel  = 0;
+static int           g_scan_view = 0;
+static bool          g_paused    = false;
+static bool          g_detail    = false;
+
 static void gotoScreen(int s) {
   s = ((s % SCR_COUNT) + SCR_COUNT) % SCR_COUNT;
-  if (s != g_screen) { g_screen = s; g_popup_until = millis() + 1200; }
+  if (s != g_screen) {
+    g_screen = s;
+    g_paused = false; g_detail = false;
+    g_scan_sel = 0;   g_scan_view = 0;
+    g_popup_until = millis() + 1200;
+  }
 }
 
 // ---- RF scan screen state (2.4 GHz WiFi APs; BLE comes from drone_scan) -----
@@ -116,9 +126,6 @@ static unsigned long g_lastAdsbOkMs    = 0;     // millis() of last successful f
 static unsigned long g_lastDataMs      = 0;     // millis() of last plane or BLE contact
 static bool          g_bleScanRunning  = false;
 static bool          g_everReceivedData= false;  // latches true on first contact of any kind
-
-// ---- scan / surveil selection -----------------------------------------------
-static int           g_scan_sel      = 0;
 
 // ---- runtime config (NVS) --------------------------------------------------
 static Preferences g_prefs;
@@ -815,8 +822,6 @@ struct RfRow { uint8_t src; char id[24]; char mac[18]; int8_t rssi; };
 
 static RfRow         g_disp[40];
 static int           g_dispN  = 0;
-static bool          g_paused = false;
-static bool          g_detail = false;
 static RfRow         g_detail_row{};
 
 enum RfFilter { RF_ALL = 0, RF_BLE, RF_24, RF_5, RF_NEAR, RF_COUNT };
@@ -830,11 +835,14 @@ static const char* filterName(int f) {
                default:      return "all"; }
 }
 
-static bool keepRow(uint8_t src, int8_t rssi, const char* id) {
-  if (g_hide_home && WiFi.status() == WL_CONNECTED && id && id[0]) {
-    String home = WiFi.SSID();
-    if (home.length() && strcmp(id, home.c_str()) == 0) return false;
-  }
+static const char* signalWord(int8_t rssi) {
+  if (rssi >= -60) return "strong";
+  if (rssi >= -75) return "medium";
+  return "weak";
+}
+
+static bool keepRow(uint8_t src, int8_t rssi, const char* id, const char* home_ssid) {
+  if (home_ssid[0] && id && id[0] && strcmp(id, home_ssid) == 0) return false;
   switch (g_filter) {
     case RF_BLE:  return src == drone::SRC_BLE;
     case RF_24:   return src == drone::SRC_WIFI_2G;
@@ -847,7 +855,6 @@ static bool keepRow(uint8_t src, int8_t rssi, const char* id) {
 static char          g_scan_top_mac[18] = "";
 static float         g_scan_anim   = 0.0f;
 static unsigned long g_scan_anim_t = 0;
-static int           g_scan_view   = 0;
 
 static struct { char mac[18]; unsigned long t; } g_rf_seen[48] = {};
 static int g_rf_seen_n = 0;
@@ -936,10 +943,16 @@ static void drawScanScreen() {
     c.rssi = rssi;
   };
 
+  char home_ssid[33]; home_ssid[0] = '\0';
+  if (g_hide_home && WiFi.status() == WL_CONNECTED) {
+    strncpy(home_ssid, WiFi.SSID().c_str(), sizeof(home_ssid) - 1);
+    home_ssid[sizeof(home_ssid) - 1] = '\0';
+  }
+
   if (!g_paused) {
     // native WiFi APs — StickS3 radio is 2.4 GHz only
     for (int i = 0; i < g_ap_count; ++i) {
-      if (!keepRow(drone::SRC_WIFI_2G, g_aps[i].rssi, g_aps[i].ssid)) continue;
+      if (!keepRow(drone::SRC_WIFI_2G, g_aps[i].rssi, g_aps[i].ssid, home_ssid)) continue;
       addWifi(g_aps[i].ssid, g_aps[i].bssid, g_aps[i].rssi, drone::SRC_WIFI_2G);
     }
 
@@ -948,7 +961,7 @@ static void drawScanScreen() {
     for (size_t i = 0; i < nb && nc < 40; ++i) {
       const char* label = bs[i].name[0] ? bs[i].name : bleVendor(bs[i].company_id, bs[i].has_mfr);
       const char* id    = label ? label : bs[i].mac;
-      if (!keepRow(drone::SRC_BLE, bs[i].rssi, id)) continue;
+      if (!keepRow(drone::SRC_BLE, bs[i].rssi, id, home_ssid)) continue;
       RfRow& c = rows[nc++]; c.src = drone::SRC_BLE;
       strncpy(c.id, id, sizeof(c.id) - 1); c.id[sizeof(c.id)-1] = '\0';
       strncpy(c.mac, bs[i].mac, sizeof(c.mac) - 1); c.mac[sizeof(c.mac)-1] = '\0';
@@ -959,7 +972,7 @@ static void drawScanScreen() {
     c5link::WifiSight ws[24]; size_t nw = c5link::wifiSnapshot(ws, 24);
     for (size_t i = 0; i < nw; ++i) {
       uint8_t src = (ws[i].band == 5) ? drone::SRC_WIFI_5G : drone::SRC_WIFI_2G;
-      if (!keepRow(src, ws[i].rssi, ws[i].ssid)) continue;
+      if (!keepRow(src, ws[i].rssi, ws[i].ssid, home_ssid)) continue;
       addWifi(ws[i].ssid, ws[i].bssid, ws[i].rssi, src);
     }
   }
@@ -1007,19 +1020,21 @@ static void drawScanScreen() {
   // slide when a new MAC reaches the top (only while not scrolled down and not paused)
   if (!g_paused && strncmp(rows[order[0]].mac, g_scan_top_mac, 17) != 0) {
     strncpy(g_scan_top_mac, rows[order[0]].mac, 17); g_scan_top_mac[17] = '\0';
-    if (g_scan_view == 0) { g_scan_anim = (float)F_ROW_H; g_scan_anim_t = millis(); }
+    // only start a glide when one isn't already running — bursts don't jerk it back to full offset
+    if (g_scan_view == 0 && g_scan_anim <= 0.0f) { g_scan_anim = (float)F_ROW_H; g_scan_anim_t = millis(); }
   }
   if (g_scan_anim > 0.0f) {
     unsigned long now2 = millis();
-    g_scan_anim -= (float)(now2 - g_scan_anim_t) * F_ROW_H / 450.0f; g_scan_anim_t = now2;
-    if (g_scan_anim < 0.0f) g_scan_anim = 0.0f;
+    float dt = (float)(now2 - g_scan_anim_t); g_scan_anim_t = now2;
+    g_scan_anim *= expf(-dt / 180.0f);          // eased glide; larger divisor = slower & smoother
+    if (g_scan_anim < 0.5f) g_scan_anim = 0.0f;  // snap home
   }
   int off = (g_scan_view == 0) ? (int)(g_scan_anim + 0.5f) : 0;
 
   // clamp + scroll window
   if (g_scan_sel >= nc) g_scan_sel = nc - 1;
   if (g_scan_sel < 0)   g_scan_sel = 0;
-  const int kVis = 5;
+  const int kVis = 3;
   if (g_scan_sel < g_scan_view)         g_scan_view = g_scan_sel;
   if (g_scan_sel >= g_scan_view + kVis) g_scan_view = g_scan_sel - kVis + 1;
 
@@ -1027,15 +1042,25 @@ static void drawScanScreen() {
   for (int vis = 0; vis <= kVis && (g_scan_view + vis) < nc; ++vis) {
     int idx = g_scan_view + vis;
     const RfRow& c = rows[order[idx]];
-    int y = F_TOP + vis * F_ROW_H - off;
+    int y  = F_TOP + vis * F_ROW_H - off;
+    int cy = y + F_ROW_H / 2;
     bool sel = (idx == g_scan_sel);
     uint16_t bg = sel ? F_SELROW : F_BG;
     if (sel) { cv.fillRect(4, y, 232, F_ROW_H, F_SELROW); cv.fillRect(4, y, 2, F_ROW_H, F_ACCENT); }
-    drawSrcBadge(8, y + 4, c.src);
+    drawSrcBadge(8, y + (F_ROW_H - 14) / 2, c.src);
+
+    // signal word, color-coded by strength
+    const char* sw  = signalWord(c.rssi);
+    uint16_t    swc = (c.rssi >= -60) ? F_ACCENT : (c.rssi >= -75) ? F_TEXT : F_DIM;
     cv.setTextSize(1);
-    cv.setTextDatum(middle_left);  cv.setTextColor(F_TEXT, bg); cv.drawString(c.id, 40, y + 11);
-    char meta[8]; snprintf(meta, sizeof(meta), "%d", c.rssi);
-    cv.setTextDatum(middle_right); cv.setTextColor(F_DIM, bg);  cv.drawString(meta, 232, y + 11);
+    cv.setTextDatum(middle_right); cv.setTextColor(swc, bg); cv.drawString(sw, 232, cy);
+
+    // name at 2x, clipped so long names don't run under the signal word
+    cv.setClipRect(44, F_TOP, 128, F_WIN_H);
+    cv.setTextSize(2);
+    cv.setTextDatum(middle_left); cv.setTextColor(F_TEXT, bg); cv.drawString(c.id, 44, cy);
+    cv.setClipRect(0, F_TOP, W, F_WIN_H);
+
     cv.drawFastHLine(8, y + F_ROW_H - 1, 224, F_HAIR);
   }
   cv.clearClipRect();
@@ -1229,35 +1254,31 @@ void loop() {
     if (millis() - g_portal_start > kPortalTimeoutMs) stopConfigPortal();
   }
 
-  // BtnA click: detail -> back; paused on SCAN -> drill in; live -> next screen
+  // BtnA click: scroll screens (always)
   if (M5.BtnA.wasClicked()) {
-    if (g_detail) {
-      g_detail = false;
-    } else if (g_paused && g_screen == SCR_SCAN && g_dispN > 0) {
-      int s = g_scan_sel; if (s < 0) s = 0; if (s >= g_dispN) s = g_dispN - 1;
-      g_detail_row = g_disp[s]; g_detail = true;
-    } else if (g_portal_active) {
-      stopConfigPortal();
-    } else {
-      gotoScreen(g_screen + 1);
-    }
+    if (g_portal_active) stopConfigPortal();
+    else                 gotoScreen(g_screen + 1);
     render();
   }
 
-  // BtnA hold (SCAN): cycle view filter, resume live so feed rebuilds immediately
-  if (M5.BtnA.wasHold() && g_screen == SCR_SCAN && !g_detail) {
-    g_filter = (g_filter + 1) % RF_COUNT;
-    g_paused = false;
+  // BtnA long-press: toggle pause / unpause the feed (SCAN only)
+  if (M5.BtnA.wasHold() && g_screen == SCR_SCAN) {
+    g_paused = !g_paused;
+    if (g_paused) g_scan_sel = 0;
+    else          g_detail   = false;
     render();
   }
 
-  // BtnB: detail -> next contact; SCAN -> first click pauses then scrolls; airspace/setup -> as before
+  // BtnB click: live = change filter; paused = scroll; in item = next contact
   if (M5.BtnB.wasClicked()) {
-    if (g_detail) {
-      if (g_dispN > 0) { g_scan_sel = (g_scan_sel + 1) % g_dispN; g_detail_row = g_disp[g_scan_sel]; }
-    } else if (g_screen == SCR_SCAN) {
-      if (!g_paused) { g_paused = true; g_scan_sel = 0; }  // first click pauses + selects top
-      else            g_scan_sel = g_scan_sel + 1;          // further clicks scroll
+    if (g_screen == SCR_SCAN) {
+      if (g_detail) {
+        if (g_dispN > 0) { g_scan_sel = (g_scan_sel + 1) % g_dispN; g_detail_row = g_disp[g_scan_sel]; }
+      } else if (!g_paused) {
+        g_filter = (g_filter + 1) % RF_COUNT;
+      } else {
+        g_scan_sel = g_scan_sel + 1;
+      }
     } else if (g_screen == SCR_AIRSPACE) {
       ++g_airspace_sel;
     } else if (g_screen == SCR_SETUP && !g_portal_active) {
@@ -1266,13 +1287,18 @@ void loop() {
     render();
   }
 
-  // BtnB hold: SCAN -> resume live; airspace -> cycle range
+  // BtnB long-press: paused = drill into item; in item = back to list; airspace = range
   if (M5.BtnB.wasHold()) {
     if (g_screen == SCR_AIRSPACE) {
       g_range_idx = (g_range_idx + 1) % appcfg::kRangePresetCount;
       services::adsb::setCenter(g_cfg.lat, g_cfg.lon, rangeKm() * 1.3f);
     } else if (g_screen == SCR_SCAN) {
-      g_paused = false; g_detail = false;
+      if (g_detail) {
+        g_detail = false;
+      } else if (g_paused && g_dispN > 0) {
+        int s = g_scan_sel; if (s < 0) s = 0; if (s >= g_dispN) s = g_dispN - 1;
+        g_detail_row = g_disp[s]; g_detail = true;
+      }
     }
     render();
   }
@@ -1387,7 +1413,7 @@ void loop() {
 
   // drive the feed slide-in at ~30 fps while it's animating (the 1 Hz idle render is too slow)
   static unsigned long last_anim = 0;
-  if (g_screen == SCR_SCAN && g_scan_anim > 0.0f && now - last_anim > 33) {
+  if (g_screen == SCR_SCAN && g_scan_anim > 0.0f && now - last_anim > 16) {
     last_anim = now; render();
   }
 
