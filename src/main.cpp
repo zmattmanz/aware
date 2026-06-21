@@ -25,6 +25,7 @@
 #include <WebServer.h>
 #include "esp32-hal-cpu.h"
 #include <esp_sleep.h>
+#include <climits>
 #include "fonts/pjs_small.h"
 #include "fonts/pjs_body.h"
 #include "fonts/pjs_num.h"
@@ -86,12 +87,12 @@ static unsigned long g_popup_until = 0;
 
 static const char* screenName(int s) {
   switch (s) {
-    case SCR_AIRSPACE: return "AIRSPACE";
-    case SCR_CONN:     return "CONNECTIONS";
-    case SCR_SCAN:     return "RF SCAN";
+    case SCR_AIRSPACE: return "Airspace";
+    case SCR_CONN:     return "Connections";
+    case SCR_SCAN:     return "RF Scan";
     case SCR_BLE:      return "BLE";
-    case SCR_STATS:    return "STATS";
-    case SCR_SETUP:    return "SETUP";
+    case SCR_STATS:    return "Stats";
+    case SCR_SETUP:    return "Setup";
     default:           return "";
   }
 }
@@ -100,6 +101,22 @@ static int           g_scan_sel  = 0;
 static int           g_scan_view = 0;
 static bool          g_paused    = false;
 static bool          g_detail    = false;
+static int           g_airspace_sel = 0;
+static bool          g_air_detail   = false;
+static unsigned long g_last_motion = 0;
+static float         g_bri         = 90.0f;
+static int           g_mv_cache    = 4000;
+static bool          g_usb_cache   = false;
+static constexpr int BRI_HI = 90;
+static constexpr int BRI_LO = 12;
+struct AContact {
+  bool  is_drone; float dist_m, brg_deg;
+  char  id[14]; char type[10];
+  int   alt_ft; float trk_deg;
+  bool  has_op; double op_lat, op_lon;
+};
+static AContact g_air[80];
+static int      g_air_count = 0;
 
 static void gotoScreen(int s) {
   s = ((s % SCR_COUNT) + SCR_COUNT) % SCR_COUNT;
@@ -107,6 +124,7 @@ static void gotoScreen(int s) {
     g_screen = s;
     g_paused = false; g_detail = false;
     g_scan_sel = 0;   g_scan_view = 0;
+    g_air_detail = false; g_airspace_sel = 0;
     g_popup_until = millis() + 1200;
   }
 }
@@ -125,9 +143,6 @@ static float         g_pdist[64];    // km, indexed by aircraft index
 static float         g_pbrg[64];     // deg
 static int           g_pcount        = 0;
 static inline float  rangeKm() { return appcfg::kRangePresetsKm[g_range_idx]; }
-
-// ---- unified airspace selection (index into sorted contact list) -----------
-static int           g_airspace_sel  = 0;
 
 // ---- airspace source health ------------------------------------------------
 static unsigned long g_lastAdsbOkMs    = 0;     // millis() of last successful fetch (0 = never)
@@ -325,23 +340,29 @@ static void drawTypeBadge(int x, int cy, uint8_t src, bool onSel = false) {
   int w = 34, h = 18;
   cv.fillSmoothRoundRect(x, cy - h / 2, w, h, h / 2, bg);
   fontSmall(); cv.setTextDatum(middle_center); cv.setTextColor(fg, bg);
+  cv.setClipRect(x, cy - h / 2, w, h);
   cv.drawString(lbl, x + w / 2, cy);
+  cv.clearClipRect();
 }
 
 static void drawPillHeader(const char* title, bool liveDot, const char* rightText) {
   int ph = 18, py = 5, px = 6, dot = liveDot ? 9 : 0;
-  fontBody();
+  fontSmall();
   int pw = cv.textWidth(title) + 16 + dot;
   cv.fillSmoothRoundRect(px, py, pw, ph, ph / 2, HEAD_BG);
   if (liveDot) cv.fillSmoothCircle(px + 11, py + ph / 2, 2, MUTE);
   cv.setTextColor(HEAD_FG, HEAD_BG); cv.setTextDatum(middle_left);
+  cv.setClipRect(px, py, pw, ph);
   cv.drawString(title, px + 8 + dot, py + ph / 2);
+  cv.clearClipRect();
   if (rightText && rightText[0]) {
     fontSmall();
     int rw = cv.textWidth(rightText) + 16, rx = W - 6 - rw;
     cv.fillSmoothRoundRect(rx, py, rw, ph, ph / 2, PILL_BG);
     cv.setTextColor(FG, PILL_BG); cv.setTextDatum(middle_center);
+    cv.setClipRect(rx, py, rw, ph);
     cv.drawString(rightText, rx + rw / 2, py + ph / 2);
+    cv.clearClipRect();
   }
 }
 
@@ -457,251 +478,166 @@ static void recomputePlanes() {
   // g_airspace_sel is clamped in drawAirspaceScreen after drones are merged in
 }
 
-enum class AirState { NORMAL, ACQUIRING, CLEAR, DEGRADED };
+static void buildAirContacts() {
+  if (g_paused || g_air_detail) return;
+  int n = 0;
+  drone::Drone dr[12]; size_t nd = drone::snapshot(dr, 12);
+  for (size_t i = 0; i < nd && n < 80; ++i) {
+    AContact c{}; c.is_drone = true;
+    c.dist_m  = dr[i].has_loc ? haversineKm(g_cfg.lat, g_cfg.lon, dr[i].lat, dr[i].lon) * 1000.0f : 0.0f;
+    c.brg_deg = dr[i].has_loc ? bearingDeg(g_cfg.lat, g_cfg.lon, dr[i].lat, dr[i].lon) : 0.0f;
+    snprintf(c.id,   sizeof(c.id),   "%.13s", dr[i].id[0] ? dr[i].id : "DRONE");
+    snprintf(c.type, sizeof(c.type), "drone");
+    c.alt_ft = INT_MIN; c.trk_deg = dr[i].dir_deg;
+    c.has_op = dr[i].has_op; c.op_lat = dr[i].op_lat; c.op_lon = dr[i].op_lon;
+    g_air[n++] = c;
+  }
+  const services::adsb::Aircraft* L = services::adsb::aircraftList();
+  for (int i = 0; i < g_pcount && n < 80; ++i) {
+    int ai = g_porder[i]; const services::adsb::Aircraft& a = L[ai];
+    AContact c{}; c.is_drone = false;
+    c.dist_m = g_pdist[ai] * 1000.0f; c.brg_deg = g_pbrg[ai];
+    snprintf(c.id,   sizeof(c.id),   "%.13s", a.callsign[0] ? a.callsign : "----");
+    snprintf(c.type, sizeof(c.type), "%s", a.emergency ? "EMERG" : (a.mil ? "mil" : "aircraft"));
+    c.alt_ft = a.alt_ft; c.trk_deg = a.track_deg; c.has_op = false;
+    g_air[n++] = c;
+  }
+  for (int i = 1; i < n; ++i) { AContact k = g_air[i]; int j = i - 1;
+    while (j >= 0 && g_air[j].dist_m > k.dist_m) { g_air[j+1] = g_air[j]; --j; } g_air[j+1] = k; }
+  g_air_count = n;
+  if (n > 0) { g_everReceivedData = true; g_lastDataMs = millis(); }
+  if (g_airspace_sel >= n) g_airspace_sel = 0;
+  if (g_airspace_sel < 0)  g_airspace_sel = 0;
+}
 
 static void drawAirspaceScreen() {
   cv.fillScreen(BG);
-  unsigned long now_ms = millis();
+  buildAirContacts();
+  int n = g_air_count;
+  if (g_airspace_sel >= n) g_airspace_sel = (n > 0) ? n - 1 : 0;
 
+  // ---- header: AIRSPACE pill + lilac "N contacts" ----
+  drawPillHeader("Airspace", true, "");
+  { char cc[14]; snprintf(cc, sizeof(cc), "%d contacts", n);
+    fontSmall(); int rw = cv.textWidth(cc) + 16, rx = W - 6 - rw;
+    cv.fillSmoothRoundRect(rx, 5, rw, 18, 9, LILAC);
+    cv.setTextColor(HEAD_FG, LILAC); cv.setTextDatum(middle_center);
+    cv.setClipRect(rx, 5, rw, 18); cv.drawString(cc, rx + rw / 2, 14); cv.clearClipRect(); }
+  if (g_paused) { fontSmall(); int tr = 6 + cv.textWidth("Airspace") + 16;
+    cv.fillRect(tr + 8, 8, 3, 10, LILAC); cv.fillRect(tr + 13, 8, 3, 10, LILAC); }
+
+  // ================= RADAR =================
+  const int cx = 64, cy = 82, R = 46;
+  const uint16_t RADAR_BG = rgb565(0x2C,0x26,0x4C), RING = rgb565(0x55,0x4C,0x80);
   auto lerp565 = [](uint16_t a, uint16_t b, float t) -> uint16_t {
-    int ar=(a>>11)&0x1F, ag=(a>>5)&0x3F, ab=a&0x1F;
-    int br=(b>>11)&0x1F, bg=(b>>5)&0x3F, bb=b&0x1F;
-    return (uint16_t)(((ar+(int)((br-ar)*t))<<11)|((ag+(int)((bg-ag)*t))<<5)|(ab+(int)((bb-ab)*t)));
+    if (t < 0) t = 0; if (t > 1) t = 1;
+    int ar=(a>>11)&0x1F, ag=(a>>5)&0x3F, ab=a&0x1F, br=(b>>11)&0x1F, bg=(b>>5)&0x3F, bb=b&0x1F;
+    return (uint16_t)(((ar+(int)lroundf((br-ar)*t))<<11)|((ag+(int)lroundf((bg-ag)*t))<<5)|(ab+(int)lroundf((bb-ab)*t)));
   };
+  auto radiusFor = [&](float dm) -> float {
+    float km = dm / 1000.0f, r = (float)R * (log10f(1.0f + km) / log10f(41.0f));
+    if (r < 4.0f) r = 4.0f; if (r > (float)R) r = (float)R; return r;
+  };
+  cv.fillSmoothCircle(cx, cy, R, RADAR_BG);
+  cv.drawCircle(cx, cy, R,           RING);
+  cv.drawCircle(cx, cy, (R * 2) / 3, RING);
+  cv.drawCircle(cx, cy, R / 3,       RING);
+  cv.drawLine(cx - R, cy, cx + R, cy, RING);
+  cv.drawLine(cx, cy - R, cx, cy + R, RING);
+  float sweep = fmodf((float)millis() * 0.10f, 360.0f);
+  const int TRAIL = 10; const float step = 5.0f;
+  for (int k = TRAIL - 1; k >= 0; --k) {
+    float a1 = sweep - k * step, a0 = a1 - step; if (a0 < 0) { a0 += 360.0f; a1 += 360.0f; }
+    float t = 1.0f - (float)k / (float)TRAIL;
+    cv.fillArc(cx, cy, 0, R - 1, a0, a1, lerp565(RADAR_BG, LILAC, t * 0.85f));
+  }
+  for (int i = 0; i < n; ++i) {
+    float rr = radiusFor(g_air[i].dist_m), a = g_air[i].brg_deg * (float)M_PI / 180.0f;
+    int px = cx + (int)lroundf(rr * sinf(a)), py = cy - (int)lroundf(rr * cosf(a));
+    if (i == g_airspace_sel) { cv.fillSmoothCircle(px, py, 3, LILAC);
+      cv.drawCircle(px, py, 6, LILAC); cv.drawCircle(px, py, 8, LILAC); }
+    else cv.fillSmoothCircle(px, py, 2, FG);
+  }
+  cv.drawCircle(cx, cy, 6, rgb565(0x12,0x12,0x16));
+  cv.fillRect(cx - 3, cy - 3, 6, 6, LILAC);
+  // ================= end radar =================
 
-  // --- Build unified contact list (nearest first) ---
-  struct AContact { bool is_drone; int idx; float dist_m; float brg_deg; };
-  static AContact contacts[76];
-  int nContacts = 0;
+  // ---- right: scrollable contact list ----
+  const int LX = 114, LR = 236, top = 30, rowH = 22, kVis = 4;
+  const uint16_t AMBER = rgb565(0xE3,0xA9,0x4C), HILITE = rgb565(0x26,0x22,0x3A);
+  if (n == 0) {
+    fontSmall(); cv.setTextDatum(middle_center); cv.setTextColor(MUTE, BG);
+    cv.drawString("clear skies", (LX + LR) / 2, 78);
+    return;
+  }
+  static int s_view = 0;
+  if (g_airspace_sel < s_view)         s_view = g_airspace_sel;
+  if (g_airspace_sel >= s_view + kVis) s_view = g_airspace_sel - kVis + 1;
+  if (s_view < 0) s_view = 0;
 
-  drone::Drone drones[12];
-  size_t nd = drone::snapshot(drones, 12);
-  int cBle = 0, c24 = 0, c5 = 0;
-  for (size_t i = 0; i < nd; ++i) {
-    switch (drones[i].source) {
-      case drone::SRC_WIFI_5G: ++c5;  break;
-      case drone::SRC_WIFI_2G: ++c24; break;
-      default:                 ++cBle; break;
-    }
-  }
-  for (size_t i = 0; i < nd; ++i) {
-    float dm = drones[i].has_loc
-               ? haversineKm(g_cfg.lat, g_cfg.lon, drones[i].lat, drones[i].lon) * 1000.0f
-               : 0.0f;
-    float db = drones[i].has_loc ? bearingDeg(g_cfg.lat, g_cfg.lon, drones[i].lat, drones[i].lon) : 0.0f;
-    contacts[nContacts++] = { true, (int)i, dm, db };
-  }
-  const services::adsb::Aircraft* acList = services::adsb::aircraftList();
-  for (int i = 0; i < g_pcount; ++i) {
-    int ai = g_porder[i];
-    contacts[nContacts++] = { false, ai, g_pdist[ai] * 1000.0f, g_pbrg[ai] };
-  }
-  for (int i = 1; i < nContacts; ++i) {
-    AContact key = contacts[i]; int j = i - 1;
-    while (j >= 0 && contacts[j].dist_m > key.dist_m) { contacts[j+1] = contacts[j]; --j; }
-    contacts[j+1] = key;
-  }
-  if (nContacts > 0) { g_everReceivedData = true; g_lastDataMs = now_ms; }
-  if (g_airspace_sel >= nContacts) g_airspace_sel = 0;
+  cv.setClipRect(LX, top, LR - LX, H - top);
+  for (int vis = 0; vis <= kVis && (s_view + vis) < n; ++vis) {
+    int idx = s_view + vis;
+    const AContact& c = g_air[idx];
+    int y = top + vis * rowH, cy2 = y + rowH / 2;
+    bool sel   = (idx == g_airspace_sel);
+    bool emerg = (strcmp(c.type, "EMERG") == 0);
+    bool mil   = (strcmp(c.type, "mil")   == 0);
+    uint16_t rbg = sel ? HILITE : BG;
+    if (sel) cv.fillSmoothRoundRect(LX, y, LR - LX, rowH - 2, 5, HILITE);
 
-  // --- Health state ---
-  bool wifiUp    = (WiFi.status() == WL_CONNECTED);
-  // adsbFresh: if we've never fetched, be optimistic (show "ok" if WiFi is up)
-  bool adsbFresh = (g_lastAdsbOkMs > 0) ? ((now_ms - g_lastAdsbOkMs) < 60000UL) : wifiUp;
-  AirState state;
-  if (nContacts > 0) {
-    state = AirState::NORMAL;
-  } else if (!g_everReceivedData && now_ms < 20000UL) {
-    state = AirState::ACQUIRING;
-  } else if (!wifiUp || !g_bleScanRunning) {
-    state = AirState::DEGRADED;
-  } else if (!adsbFresh) {
-    state = AirState::DEGRADED;
+    uint16_t dotc = emerg ? COL_BAD : (c.is_drone ? LILAC : rgb565(0xB0,0xB0,0xBC));
+    cv.fillSmoothCircle(LX + 6, cy2, 3, dotc);
+
+    float nm = c.dist_m / 1852.0f;
+    char ds[10]; snprintf(ds, sizeof(ds), "%.1fnm", nm);
+    fontSmall(); cv.setTextDatum(middle_right); cv.setTextColor(sel ? FG : MUTE, rbg);
+    cv.setClipRect(LX, y, LR - LX, rowH); cv.drawString(ds, LR - 4, cy2); cv.clearClipRect();
+    int distLeft = LR - 4 - cv.textWidth(ds) - 6;
+
+    uint16_t namec = emerg ? COL_BAD : (mil ? AMBER : FG);
+    fontBody(); cv.setTextDatum(middle_left); cv.setTextColor(namec, rbg);
+    int nameW = distLeft - (LX + 16);
+    cv.setClipRect(LX + 16, y, nameW > 0 ? nameW : 0, rowH);
+    cv.drawString(c.id, LX + 16, cy2);
+    cv.clearClipRect();
+  }
+  cv.clearClipRect();
+}
+
+static void drawAirspaceDetail() {
+  cv.fillRect(0, 0, W, H, BG);
+  buildAirContacts();
+  int n = g_air_count;
+  if (n == 0) { fontBody(); cv.setTextDatum(middle_center); cv.setTextColor(MUTE, BG);
+                cv.drawString("no contacts", W / 2, H / 2); return; }
+  if (g_airspace_sel >= n) g_airspace_sel = 0;
+  const AContact& c = g_air[g_airspace_sel];
+
+  char pos[12]; snprintf(pos, sizeof(pos), "%d/%d", g_airspace_sel + 1, n);
+  drawPillHeader(c.is_drone ? "Drone" : "Aircraft", true, pos);
+
+  fontBody(); cv.setTextDatum(top_left); cv.setTextColor(c.is_drone ? LILAC : FG, BG);
+  cv.setClipRect(8, 28, 224, 22); cv.drawString(c.id, 8, 30); cv.clearClipRect();
+  fontSmall(); cv.setTextColor(MUTE, BG); cv.drawString(c.type, 8, 52);
+
+  auto row = [&](int ry, const char* k, const char* v) {
+    drawCard(6, ry, 228, 22, CARD, false);
+    fontSmall(); cv.setTextDatum(middle_left);  cv.setTextColor(MUTE, CARD); cv.drawString(k, 16, ry + 11);
+    cv.setTextDatum(middle_right); cv.setTextColor(FG, CARD); cv.drawString(v, 218, ry + 11);
+  };
+  char v[24];
+  if (c.dist_m < 1000.0f) snprintf(v, sizeof(v), "%dm", (int)c.dist_m);
+  else                    snprintf(v, sizeof(v), "%.1f km", c.dist_m / 1000.0f);
+  row(62, "DISTANCE", v);
+  snprintf(v, sizeof(v), "%.0f deg", c.brg_deg); row(86, "BEARING", v);
+  if (!c.is_drone) {
+    if (c.alt_ft != INT_MIN) snprintf(v, sizeof(v), "%d ft", c.alt_ft); else snprintf(v, sizeof(v), "--");
+    row(110, "ALTITUDE", v);
+  } else if (c.has_op) {
+    snprintf(v, sizeof(v), "%.3f, %.3f", c.op_lat, c.op_lon); row(110, "PILOT", v);
   } else {
-    state = AirState::CLEAR;
-  }
-
-  // --- Pill header ---
-  bool dataLive = (g_lastDataMs > 0) && ((now_ms - g_lastDataMs) < 8000UL);
-  char hdrR[20];
-  if (nContacts > 0)
-    snprintf(hdrR, sizeof(hdrR), "%d %s", nContacts, nContacts == 1 ? "contact" : "contacts");
-  else if (state == AirState::CLEAR)      snprintf(hdrR, sizeof(hdrR), "clear");
-  else if (state == AirState::ACQUIRING)  snprintf(hdrR, sizeof(hdrR), "scanning");
-  else                                    snprintf(hdrR, sizeof(hdrR), "offline");
-  drawPillHeader("AIRSPACE", dataLive, hdrR);
-
-  // --- Radar scope (left, cx=64, cy=82, R=46) ---
-  static constexpr int RCX = 64, RCY = 82, RRAD = 46;
-  static constexpr uint16_t RADAR_BG = rgb565(0x10,0x10,0x18);
-
-  cv.fillSmoothCircle(RCX, RCY, RRAD, RADAR_BG);
-  cv.drawLine(RCX, RCY - RRAD - 2, RCX, RCY + RRAD + 2, LINE);
-  cv.drawLine(RCX - RRAD - 2, RCY, RCX + RRAD + 2, RCY, LINE);
-
-  // Sweep fade trail with fillArc
-  {
-    static float sweepDeg = 0.0f;
-    sweepDeg += 5.0f;
-    if (sweepDeg >= 360.0f) sweepDeg -= 360.0f;
-
-    auto safeArc = [&](float a0, float a1, uint16_t col) {
-      while (a0 < 0.0f) a0 += 360.0f;
-      while (a1 < a0)   a1 += 360.0f;
-      if (a1 > 360.0f) {
-        cv.fillArc(RCX, RCY, 0, RRAD, a0, 360.0f, col);
-        cv.fillArc(RCX, RCY, 0, RRAD, 0.0f, a1 - 360.0f, col);
-      } else {
-        cv.fillArc(RCX, RCY, 0, RRAD, a0, a1, col);
-      }
-    };
-
-    const float STEP_W = 6.0f;
-    const int SWEEP_STEPS = 10;
-    for (int s = SWEEP_STEPS - 1; s >= 0; --s) {
-      float a1 = sweepDeg - s * STEP_W;
-      float a0 = a1 - STEP_W;
-      float t  = 1.0f - (float)s / SWEEP_STEPS;
-      safeArc(a0, a1, lerp565(RADAR_BG, LILAC, t * 0.55f));
-    }
-    float sa = sweepDeg * (float)M_PI / 180.0f;
-    cv.drawLine(RCX, RCY,
-                RCX + (int)lroundf(RRAD * sinf(sa)),
-                RCY - (int)lroundf(RRAD * cosf(sa)),
-                LILAC);
-  }
-
-  // Rings (drawn over sweep so they stay crisp)
-  cv.drawCircle(RCX, RCY, RRAD,       LINE);
-  cv.drawCircle(RCX, RCY, RRAD * 2/3, LINE);
-  cv.drawCircle(RCX, RCY, RRAD / 3,   LILAC);
-
-  // Contacts: planes first, drones on top
-  for (int pass = 0; pass < 2; ++pass) {
-    for (int i = 0; i < nContacts; ++i) {
-      const AContact& c = contacts[i];
-      if ((pass == 0) == c.is_drone) continue;
-      float r = airspaceRadiusFor(c.is_drone, c.dist_m);
-      float a = c.brg_deg * (float)M_PI / 180.0f;
-      int px = RCX + (int)lroundf(r * sinf(a));
-      int py = RCY - (int)lroundf(r * cosf(a));
-      bool sel = (i == g_airspace_sel);
-      if (c.is_drone) {
-        if (sel) cv.drawCircle(px, py, 7, LILAC);
-        cv.fillSmoothCircle(px, py, 3, DEEP_ACC);
-      } else {
-        float hdg = acList[c.idx].track_deg > 0.0f ? acList[c.idx].track_deg : c.brg_deg;
-        if (sel) cv.drawCircle(px, py, 8, LILAC);
-        drawPlane(px, py, hdg, 0.75f, sel ? LILAC : FG);
-      }
-    }
-  }
-  // You-are-here: lilac square at radar center
-  cv.fillRect(RCX - 2, RCY - 2, 5, 5, LILAC);
-
-  // --- Right panel ---
-  static constexpr int cX = 124, cY = 78, cW = 112, cH = 46;
-  int midRX = cX + cW / 2;
-
-  // Source health dots (wifi · ble · c5)
-  {
-    const bool oks[]      = { wifiUp, g_bleScanRunning, c5link::linked() };
-    const char* lbls[]    = { "wifi", "ble", "c5" };
-    int dx = cX + 8;
-    for (int k = 0; k < 3; ++k) {
-      cv.fillSmoothCircle(dx, 30, 2, oks[k] ? VERD : COL_BAD);
-      cv.setTextDatum(middle_left); fontSmall();
-      cv.setTextColor(MUTE, BG);
-      cv.drawString(lbls[k], dx + 5, 30);
-      dx += 36;
-    }
-  }
-
-  // Big count or empty-state label
-  {
-    cv.setTextDatum(middle_center);
-    if (nContacts > 0) {
-      fontBody(); cv.setTextColor(FG, BG);
-      char cnt[4]; snprintf(cnt, sizeof(cnt), "%d", nContacts);
-      cv.drawString(cnt, midRX, 52);
-      fontSmall(); cv.setTextColor(MUTE, BG);
-      cv.drawString(nContacts == 1 ? "contact" : "contacts", midRX, 66);
-    } else {
-      fontSmall(); cv.setTextColor(MUTE, BG);
-      if      (state == AirState::ACQUIRING) cv.drawString("scanning...", midRX, 55);
-      else if (state == AirState::CLEAR)     cv.drawString("sky clear",   midRX, 55);
-      else                                   cv.drawString("offline",     midRX, 55);
-    }
-  }
-
-  // Contact card for selected entry
-  if (nContacts > 0 && g_airspace_sel < nContacts) {
-    const AContact& sel = contacts[g_airspace_sel];
-    drawCard(cX, cY, cW, cH, CARD, true);
-    int tx = cX + 8, ty = cY + 6;
-    fontSmall();
-
-    if (sel.is_drone) {
-      const drone::Drone& d = drones[sel.idx];
-      cv.setTextDatum(top_left);
-      cv.setTextColor(LILAC, CARD);
-      cv.drawString(d.id[0] ? d.id : "DRONE", tx, ty);
-      cv.setTextDatum(top_right);
-      cv.setTextColor(droneSrcCol(d.source), CARD);
-      cv.drawString(droneSrcTag(d.source), cX + cW - 8, ty);
-      // distance + bearing
-      char dist[16];
-      if (sel.dist_m < 1000.0f) snprintf(dist, sizeof(dist), "%dm %s",    (int)sel.dist_m,        compass8(sel.brg_deg));
-      else                      snprintf(dist, sizeof(dist), "%.1fkm %s",  sel.dist_m / 1000.0f,   compass8(sel.brg_deg));
-      cv.setTextDatum(top_left); cv.setTextColor(MUTE, CARD);
-      cv.drawString(dist, tx, ty + 14);
-      // rssi or pilot dist on right
-      cv.setTextDatum(top_right); cv.setTextColor(MUTE, CARD);
-      if (d.has_op) {
-        float opM = haversineKm(g_cfg.lat, g_cfg.lon, d.op_lat, d.op_lon) * 1000.0f;
-        char op[16];
-        if (opM < 1000.0f) snprintf(op, sizeof(op), "pilot %dm",    (int)opM);
-        else               snprintf(op, sizeof(op), "pilot %.1fkm",  opM / 1000.0f);
-        cv.drawString(op, cX + cW - 8, ty + 14);
-      } else {
-        char rssi[8]; snprintf(rssi, sizeof(rssi), "%ddBm", d.rssi);
-        cv.drawString(rssi, cX + cW - 8, ty + 14);
-      }
-      // mac (dim, bottom line)
-      cv.setTextDatum(top_left); cv.setTextColor(LINE, CARD);
-      cv.drawString(d.mac, tx, ty + 28);
-    } else {
-      const services::adsb::Aircraft& ac = acList[sel.idx];
-      cv.setTextDatum(top_left);
-      cv.setTextColor(ac.emergency ? COL_BAD : FG, CARD);
-      cv.drawString(ac.callsign[0] ? ac.callsign : "----", tx, ty);
-      cv.setTextDatum(top_right);
-      if (ac.mil) { cv.setTextColor(COL_HEAD, CARD); cv.drawString("MIL", cX + cW - 8, ty); }
-      else if (ac.type[0]) { cv.setTextColor(MUTE, CARD); cv.drawString(ac.type, cX + cW - 8, ty); }
-      // distance + bearing
-      float nm = sel.dist_m / 1852.0f;
-      char dist[16];
-      if (nm < 10.0f) snprintf(dist, sizeof(dist), "%.1fnm %s", nm, compass8(sel.brg_deg));
-      else            snprintf(dist, sizeof(dist), "%.0fnm %s",  nm, compass8(sel.brg_deg));
-      cv.setTextDatum(top_left); cv.setTextColor(MUTE, CARD);
-      cv.drawString(dist, tx, ty + 14);
-      if (ac.alt[0]) { cv.setTextDatum(top_right); cv.setTextColor(MUTE, CARD); cv.drawString(ac.alt, cX + cW - 8, ty + 14); }
-      // speed or emergency squawk
-      cv.setTextDatum(top_left);
-      if (ac.emergency && ac.squawk[0]) {
-        cv.setTextColor(COL_BAD, CARD);
-        char sq[10]; snprintf(sq, sizeof(sq), "SQK %s", ac.squawk);
-        cv.drawString(sq, tx, ty + 28);
-      } else if (ac.gs_knots > 0.0f) {
-        cv.setTextColor(MUTE, CARD);
-        char spd[10]; snprintf(spd, sizeof(spd), "%.0fkt", ac.gs_knots);
-        cv.drawString(spd, tx, ty + 28);
-      }
-    }
-  } else {
-    drawCard(cX, cY, cW, cH, CARD, false);
-    cv.setTextDatum(middle_center); fontSmall(); cv.setTextColor(MUTE, CARD);
-    cv.drawString("no contact", cX + cW / 2, cY + cH / 2);
+    snprintf(v, sizeof(v), "%.0f deg", c.trk_deg); row(110, "HEADING", v);
   }
 }
 
@@ -720,7 +656,7 @@ static void drawStubScreen(const char* title, const char* note) {
 // STATS (battery / temperature / system)
 // ---------------------------------------------------------------------------
 static void drawStatsScreen() {
-  drawTopBar("STATS");
+  drawTopBar("Stats");
   cv.setTextDatum(top_left);
   fontSmall();
   int y = CONTENT_Y + 4;
@@ -760,6 +696,7 @@ static void drawStatsScreen() {
 // ---------------------------------------------------------------------------
 static void drawConnScreen() {
   cv.fillRect(0, 0, W, H, BG);
+  drawTopBar("Connections");
 
   // ---- data ----
   bool c5up = c5link::linked();
@@ -774,25 +711,26 @@ static void drawConnScreen() {
     else { s_lb = b; s_lt = nm; } }
   if (s_kbps < 0 || !c5up) s_kbps = 0;
 
-  // ---- hero (fills from the top, no header) ----
-  int hx = 6, hy = 6, hw = 228, hh = 50;
+  // ---- hero: title (line 1), subtitle + big KB/s (line 2) ----
+  int hx = 6, hy = 27, hw = 228, hh = 44;
   uint16_t hbg  = c5up ? MINT : CARD;
   uint16_t hsub = c5up ? rgb565(0xC8,0xE6,0xD4) : MUTE;
   drawCard(hx, hy, hw, hh, hbg, false);
   cv.fillSmoothCircle(hx + 12, hy + 22, 4, c5up ? VERD : COL_BAD);
+
   fontBody(); cv.setTextDatum(top_left); cv.setTextColor(FG, hbg);
-  cv.setClipRect(hx + 24, hy, hw - 30, 24);
-  cv.drawString("C5 co-processor", hx + 24, hy + 9);
+  cv.setClipRect(hx + 24, hy, 150, 22);
+  cv.drawString("C5 co-processor", hx + 24, hy + 5);
   cv.clearClipRect();
+
   char kb[14];
   if (c5up) snprintf(kb, sizeof(kb), "%.1f KB/s", s_kbps); else snprintf(kb, sizeof(kb), "--");
-  fontSmall();
-  cv.setTextDatum(top_left);  cv.setTextColor(hsub, hbg);
-  cv.drawString(c5up ? "linked - 5 GHz" : "no link", hx + 24, hy + 32);
-  cv.setTextDatum(top_right); cv.setTextColor(c5up ? FG : MUTE, hbg);
-  cv.drawString(kb, hx + hw - 12, hy + 32);
+  fontSmall(); cv.setTextDatum(top_left); cv.setTextColor(hsub, hbg);
+  cv.drawString(c5up ? "linked \xB7 5 GHz radio" : "no link", hx + 24, hy + 25);
+  fontBody(); cv.setTextDatum(middle_right); cv.setTextColor(c5up ? FG : MUTE, hbg);
+  cv.drawString(kb, hx + hw - 10, hy + 30);
 
-  // ---- 2x2 grid, even gutters, vertically centered ----
+  // ---- 2x2 grid ----
   auto tile = [&](int x, int y, int w, int h, const char* label, uint16_t dot, const char* val) {
     drawCard(x, y, w, h, CARD, false);
     int cy = y + h / 2;
@@ -801,8 +739,8 @@ static void drawConnScreen() {
     cv.setTextDatum(middle_left);  cv.setTextColor(FG, CARD);   cv.drawString(label, x + 24, cy);
     cv.setTextDatum(middle_right); cv.setTextColor(MUTE, CARD); cv.drawString(val, x + w - 10, cy);
   };
-  int gh = 31, tw = (hw - 6) / 2;
-  int gy1 = hy + hh + 6, gy2 = gy1 + gh + 5;
+  int gh = 27, tw = (hw - 6) / 2;
+  int gy1 = hy + hh + 4, gy2 = gy1 + gh + 3;
   int x1 = hx, x2 = hx + tw + 6;
   char v[12];
   snprintf(v, sizeof(v), "%d dev", (int)drone::bleCount());
@@ -889,16 +827,25 @@ static const char* trackerLabel(uint8_t t) {
 static void drawBleScreen() {
   cv.fillRect(0, 0, W, H, BG);
 
-  drone::BleSight b[24];
-  size_t n   = drone::bleSnapshot(b, 24);
-  size_t trk = drone::trackerCount();
+  static drone::BleSight g_bleFrozen[24];
+  static size_t g_bleFrozenN = 0;
 
-  // trackers first, then strongest RSSI
-  for (size_t i = 0; i < n; ++i)
-    for (size_t j = i + 1; j < n; ++j) {
-      bool ti = b[i].tracker != drone::TRK_NONE, tj = b[j].tracker != drone::TRK_NONE;
-      if ((tj && !ti) || (ti == tj && b[j].rssi > b[i].rssi)) { auto t = b[i]; b[i] = b[j]; b[j] = t; }
-    }
+  drone::BleSight b[24];
+  size_t n;
+  if (g_paused) {
+    n = g_bleFrozenN;
+    for (size_t i = 0; i < n; ++i) b[i] = g_bleFrozen[i];
+  } else {
+    n = drone::bleSnapshot(b, 24);
+    for (size_t i = 0; i < n; ++i)
+      for (size_t j = i + 1; j < n; ++j) {
+        bool ti = b[i].tracker != drone::TRK_NONE, tj = b[j].tracker != drone::TRK_NONE;
+        if ((tj && !ti) || (ti == tj && b[j].rssi > b[i].rssi)) { auto t = b[i]; b[i] = b[j]; b[j] = t; }
+      }
+    g_bleFrozenN = n;
+    for (size_t i = 0; i < n; ++i) g_bleFrozen[i] = b[i];
+  }
+  size_t trk = 0; for (size_t i = 0; i < n; ++i) if (b[i].tracker != drone::TRK_NONE) ++trk;
 
   // header: light "BLE" pill + red "N trackers" pill (neutral when none)
   drawPillHeader("BLE", false, "");
@@ -910,7 +857,15 @@ static void drawBleScreen() {
   uint16_t rpfg = trk ? rgb565(0xFF,0xFF,0xFF) : FG;
   fontSmall(); int rw = cv.textWidth(rp) + 16, rx = W - 6 - rw;
   cv.fillSmoothRoundRect(rx, 5, rw, 18, 9, rpbg);
-  cv.setTextColor(rpfg, rpbg); cv.setTextDatum(middle_center); cv.drawString(rp, rx + rw / 2, 14);
+  cv.setTextColor(rpfg, rpbg); cv.setTextDatum(middle_center);
+  cv.setClipRect(rx, 5, rw, 18);
+  cv.drawString(rp, rx + rw / 2, 14);
+  cv.clearClipRect();
+
+  if (g_paused) {
+    fontBody(); int tr = 6 + cv.textWidth("BLE") + 16;
+    cv.fillRect(tr + 8, 8, 3, 10, LILAC); cv.fillRect(tr + 13, 8, 3, 10, LILAC);
+  }
 
   if (n == 0) {
     cv.setTextDatum(middle_center); cv.setTextColor(MUTE, BG); fontSmall();
@@ -1049,62 +1004,71 @@ static void drawScanScreen() {
 
   if (!g_paused) { for (int i = 0; i < nc; ++i) g_disp[i] = rows[order[i]]; g_dispN = nc; }
 
-  // ---- header: light title pill + N found / filter / paused ----
-  char rt[14];
-  if (g_paused)                snprintf(rt, sizeof(rt), "paused");
-  else if (g_filter != RF_ALL) snprintf(rt, sizeof(rt), "%s", filterName(g_filter));
-  else                         snprintf(rt, sizeof(rt), "%d found", nc);
-  bool scanLive = !g_paused && (((millis() / 600) % 2) == 0);
-  drawPillHeader("RF SCAN", scanLive, rt);
+  // ---- no header: rows fill from the top, footer at the bottom ----
+  const int RTOP = 4, FOOT = H - 16, RWIN = FOOT - RTOP - 2;
 
   if (nc == 0) {
-    cv.setTextDatum(middle_center); cv.setTextColor(MUTE, BG); fontSmall();
-    cv.drawString(g_wifi_scanning ? "scanning..." : "watching wifi + ble...", W / 2, H / 2 + 6);
-    return;
+    fontSmall(); cv.setTextDatum(middle_center); cv.setTextColor(MUTE, BG);
+    cv.drawString(g_wifi_scanning ? "scanning..." : "watching wifi + ble...", W / 2, H / 2);
+  } else {
+    if (!g_paused && strncmp(rows[order[0]].mac, g_scan_top_mac, 17) != 0) {
+      strncpy(g_scan_top_mac, rows[order[0]].mac, 17); g_scan_top_mac[17] = '\0';
+      if (g_scan_view == 0 && g_scan_anim <= 0.0f) { g_scan_anim = (float)F_ROW_H; g_scan_anim_t = millis(); }
+    }
+    if (g_scan_anim > 0.0f) {
+      unsigned long now2 = millis(); float dt = (float)(now2 - g_scan_anim_t); g_scan_anim_t = now2;
+      g_scan_anim *= expf(-dt / 180.0f); if (g_scan_anim < 0.5f) g_scan_anim = 0.0f;
+    }
+    int off = (g_scan_view == 0) ? (int)(g_scan_anim + 0.5f) : 0;
+
+    if (g_scan_sel >= nc) g_scan_sel = nc - 1;
+    if (g_scan_sel < 0)   g_scan_sel = 0;
+    const int kVis = 3;
+    if (g_scan_sel < g_scan_view)         g_scan_view = g_scan_sel;
+    if (g_scan_sel >= g_scan_view + kVis) g_scan_view = g_scan_sel - kVis + 1;
+
+    cv.setClipRect(0, RTOP, W, RWIN);
+    for (int vis = 0; vis <= kVis && (g_scan_view + vis) < nc; ++vis) {
+      int idx = g_scan_view + vis;
+      const RfRow& c = rows[order[idx]];
+      int y  = RTOP + vis * F_ROW_H - off;
+      int cy = y + (F_ROW_H - 4) / 2;
+      bool sel = (idx == g_scan_sel);
+      uint16_t rbg = sel ? LILAC : CARD, fg = sel ? HEAD_FG : FG;
+      cv.fillSmoothRoundRect(4, y, 232, F_ROW_H - 4, 8, rbg);
+      drawTypeBadge(12, cy, c.src, sel);
+      char rs[8]; snprintf(rs, sizeof(rs), "%d", c.rssi);
+      fontSmall(); cv.setTextDatum(middle_right);
+      cv.setTextColor(sel ? HEAD_FG : MUTE, rbg); cv.drawString(rs, 226, cy);
+      int nameW = (226 - cv.textWidth(rs) - 8) - 52;
+      cv.setClipRect(52, RTOP, nameW > 0 ? nameW : 0, RWIN);
+      fontBody(); cv.setTextDatum(middle_left);
+      cv.setTextColor(fg, rbg); cv.drawString(c.id, 52, cy);
+      cv.setClipRect(0, RTOP, W, RWIN);
+    }
+    cv.clearClipRect();
   }
 
-  if (!g_paused && strncmp(rows[order[0]].mac, g_scan_top_mac, 17) != 0) {
-    strncpy(g_scan_top_mac, rows[order[0]].mac, 17); g_scan_top_mac[17] = '\0';
-    if (g_scan_view == 0 && g_scan_anim <= 0.0f) { g_scan_anim = (float)F_ROW_H; g_scan_anim_t = millis(); }
+  // ---- footer: device count (left) + filter (right) ----
+  cv.drawFastHLine(6, FOOT, W - 12, LINE);
+  fontSmall();
+  int lx = 10;
+  if (g_paused) {
+    cv.fillRect(lx, FOOT + 5, 3, 8, LILAC); cv.fillRect(lx + 5, FOOT + 5, 3, 8, LILAC); lx += 14;
   }
-  if (g_scan_anim > 0.0f) {
-    unsigned long now2 = millis();
-    float dt = (float)(now2 - g_scan_anim_t); g_scan_anim_t = now2;
-    g_scan_anim *= expf(-dt / 180.0f);
-    if (g_scan_anim < 0.5f) g_scan_anim = 0.0f;
-  }
-  int off = (g_scan_view == 0) ? (int)(g_scan_anim + 0.5f) : 0;
+  char cstr[16]; snprintf(cstr, sizeof(cstr), "%d devices", nc);
+  cv.setTextDatum(middle_left); cv.setTextColor(g_paused ? LILAC : MUTE, BG);
+  cv.drawString(cstr, lx, FOOT + 8);
 
-  if (g_scan_sel >= nc) g_scan_sel = nc - 1;
-  if (g_scan_sel < 0)   g_scan_sel = 0;
-  const int kVis = 3;
-  if (g_scan_sel < g_scan_view)         g_scan_view = g_scan_sel;
-  if (g_scan_sel >= g_scan_view + kVis) g_scan_view = g_scan_sel - kVis + 1;
-
-  cv.setClipRect(0, F_TOP, W, F_WIN_H);
-  for (int vis = 0; vis <= kVis && (g_scan_view + vis) < nc; ++vis) {
-    int idx = g_scan_view + vis;
-    const RfRow& c = rows[order[idx]];
-    int y  = F_TOP + vis * F_ROW_H - off;
-    int cy = y + (F_ROW_H - 4) / 2;
-    bool sel = (idx == g_scan_sel);
-
-    uint16_t rbg = sel ? LILAC : CARD;
-    uint16_t rfg = sel ? HEAD_FG : FG;
-    cv.fillSmoothRoundRect(4, y, 232, F_ROW_H - 4, 8, rbg);
-
-    drawTypeBadge(12, cy, c.src, sel);
-
-    char rs[8]; snprintf(rs, sizeof(rs), "%d", c.rssi);
-    fontSmall(); cv.setTextDatum(middle_right);
-    cv.setTextColor(sel ? HEAD_FG : MUTE, rbg); cv.drawString(rs, 226, cy);
-
-    int nameW = (226 - cv.textWidth(rs) - 8) - 52;
-    cv.setClipRect(52, F_TOP, nameW > 0 ? nameW : 0, F_WIN_H);
-    fontBody(); cv.setTextDatum(middle_left);
-    cv.setTextColor(rfg, rbg); cv.drawString(c.id, 52, cy);
-    cv.setClipRect(0, F_TOP, W, F_WIN_H);
-  }
+  const char* fn = (g_filter == RF_ALL) ? "all" : filterName(g_filter);
+  uint16_t fcol; switch (g_filter) {
+    case RF_BLE:  fcol = BB_FG; break; case RF_24: fcol = B2_FG; break;
+    case RF_5:    fcol = B5_FG; break; case RF_NEAR: fcol = VERD; break; default: fcol = FG; }
+  int pw = cv.textWidth(fn) + 14, px = W - 8 - pw;
+  cv.fillSmoothRoundRect(px, FOOT + 2, pw, 13, 6, PILL_BG);
+  cv.setTextDatum(middle_center); cv.setTextColor(fcol, PILL_BG);
+  cv.setClipRect(px, FOOT + 2, pw, 13);
+  cv.drawString(fn, px + pw / 2, FOOT + 8);
   cv.clearClipRect();
 }
 
@@ -1186,7 +1150,7 @@ static void drawDetailScreen() {
 // ---------------------------------------------------------------------------
 static void drawSetupScreen() {
   cv.fillRect(0, 0, W, H, BG);
-  drawTopBar("SETUP");
+  drawTopBar("Setup");
 
   if (!g_portal_active) {
     bool wup = (WiFi.status() == WL_CONNECTED);
@@ -1250,6 +1214,7 @@ static void drawSrcBadge(int x, int y, uint8_t src) {
 // ---------------------------------------------------------------------------
 static void render() {
   if (g_detail) { cv.fillScreen(F_BG); drawDetailScreen(); cv.pushSprite(0, 0); return; }
+  if (g_screen == SCR_AIRSPACE && g_air_detail) { cv.fillScreen(BG); drawAirspaceDetail(); cv.pushSprite(0, 0); return; }
   cv.fillScreen(COL_BG);
   switch (g_screen) {
     case SCR_AIRSPACE: drawAirspaceScreen(); break;
@@ -1316,6 +1281,7 @@ void setup() {
 
 void loop() {
   M5.update();
+  if (M5.BtnA.wasPressed() || M5.BtnB.wasPressed()) g_last_motion = millis();
   static bool s_c5_up = false;
   if (!s_c5_up) { s_c5_up = true; c5link::begin(); }
   c5link::poll();  // drain C5 UART every iteration so it never backs up
@@ -1340,7 +1306,7 @@ void loop() {
   }
 
   // BtnA long-press: toggle pause / unpause the feed (SCAN or BLE)
-  if (M5.BtnA.wasHold() && (g_screen == SCR_SCAN || g_screen == SCR_BLE)) {
+  if (M5.BtnA.wasHold() && (g_screen == SCR_SCAN || g_screen == SCR_BLE || g_screen == SCR_AIRSPACE)) {
     g_paused = !g_paused;
     if (g_paused) g_scan_sel = 0;
     else          g_detail   = false;
@@ -1376,7 +1342,7 @@ void loop() {
         g_scan_sel++;
       }
     } else if (g_screen == SCR_AIRSPACE) {
-      ++g_airspace_sel;
+      if (g_air_count > 0) g_airspace_sel = (g_airspace_sel + 1) % g_air_count;
     } else if (g_screen == SCR_SETUP && !g_portal_active) {
       startConfigPortal();
     }
@@ -1386,8 +1352,12 @@ void loop() {
   // BtnB long-press: paused = drill into item; in item = back to list; airspace = range
   if (M5.BtnB.wasHold()) {
     if (g_screen == SCR_AIRSPACE) {
-      g_range_idx = (g_range_idx + 1) % appcfg::kRangePresetCount;
-      services::adsb::setCenter(g_cfg.lat, g_cfg.lon, rangeKm() * 1.3f);
+      if (g_air_count > 0) {
+        g_air_detail = !g_air_detail;
+      } else {
+        g_range_idx = (g_range_idx + 1) % appcfg::kRangePresetCount;
+        services::adsb::setCenter(g_cfg.lat, g_cfg.lon, rangeKm() * 1.3f);
+      }
     } else if (g_screen == SCR_SCAN || g_screen == SCR_BLE) {
       if (g_detail) {
         g_detail = false;
@@ -1434,7 +1404,6 @@ void loop() {
   static unsigned long last_imu    = 0;
   static float         gx = 0, gy = 0, gz = 0;  // low-pass gravity estimate
   static float         last_mag    = 1.0f;
-  static unsigned long last_motion = 0;
   if (now - last_imu > 100) {
     last_imu = now;
     float ax, ay, az;
@@ -1449,7 +1418,7 @@ void loop() {
       if (want != rot) { rot = want; M5.Display.setRotation(rot); render(); }
     }
     float mag = sqrtf(ax*ax + ay*ay + az*az);
-    if (fabsf(mag - last_mag) > 0.06f) last_motion = now;
+    if (fabsf(mag - last_mag) > 0.06f) g_last_motion = now;
     last_mag = mag;
   }
 
@@ -1459,10 +1428,9 @@ void loop() {
     last_batt = now;
     int  mv    = M5.Power.getBatteryVoltage();
     bool onUsb = M5.Power.isCharging();
-    bool idle  = (now - last_motion) > 60000UL;
+    g_mv_cache = mv; g_usb_cache = onUsb;
     if (onUsb || mv <= 0) {
       low_reads = 0;
-      applyBrightness(false, mv, onUsb);     // on charge: restore brightness regardless of idle
     } else if (mv < 3100) {
       if (++low_reads >= 3) {                // ~15 s sustained before sleeping
         cv.fillScreen(COL_BG);
@@ -1478,7 +1446,6 @@ void loop() {
       }
     } else {
       low_reads = 0;
-      applyBrightness(idle, mv, onUsb);
     }
   }
 
@@ -1525,6 +1492,8 @@ void loop() {
   if (g_screen == SCR_SCAN && g_scan_anim > 0.0f && now - last_anim > 16) {
     last_anim = now; render();
   }
+  static unsigned long last_air = 0;
+  if (g_screen == SCR_AIRSPACE && !g_air_detail && now - last_air > 33) { last_air = now; render(); }
 
   if (g_popup_until && now >= g_popup_until) { g_popup_until = 0; render(); }
 
@@ -1533,6 +1502,20 @@ void loop() {
 
   static unsigned long last_detail = 0;
   if (g_detail && now - last_detail > 300) { last_detail = now; render(); }
+
+  {
+    static unsigned long s_bri_t = 0;
+    if (now - s_bri_t >= 16) {
+      s_bri_t = now;
+      bool awake  = g_usb_cache || (now - g_last_motion) < 5000UL;
+      int  target = awake ? BRI_HI : BRI_LO;
+      if (!g_usb_cache && g_mv_cache > 0 && g_mv_cache < 3300 && target > 40) target = 40;
+      float rate = (target > g_bri) ? 5.0f : 2.0f;
+      if      (g_bri < target) { g_bri += rate; if (g_bri > target) g_bri = target; }
+      else if (g_bri > target) { g_bri -= rate; if (g_bri < target) g_bri = target; }
+      M5.Display.setBrightness((uint8_t)(g_bri + 0.5f));
+    }
+  }
 
   delay(10);
 }
