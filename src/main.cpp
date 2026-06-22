@@ -101,6 +101,7 @@ static const char* screenName(int s) {
 static int           g_scan_sel  = 0;
 static int           g_scan_view = 0;
 static bool          g_paused    = false;
+static int           g_dispN     = 0;
 static constexpr float TICKER_PXPS = 18.0f;   // steady ticker speed (px/sec)
 static float         g_feed_scroll = 0.0f;
 static float         g_feed_glide  = 0.0f;
@@ -108,6 +109,11 @@ static unsigned long g_feed_t      = 0;
 static int           g_feed_dir    = 1;
 static bool          g_feed_manual = false;
 static unsigned long g_feed_touch  = 0;
+static float         g_feed_vel    = TICKER_PXPS;  // target scroll velocity (px/s); tilt drives it
+static float         g_feed_vel_eased = TICKER_PXPS; // smoothed velocity actually applied per frame
+static float         g_tilt_neutral = 99.0f;       // adaptive resting pitch (99 = uninitialised)
+static bool          g_tilt_scrub  = false;        // past the deadzone right now
+static int           g_tilt_dir    = 0;            // -1 up, +1 down (for the chevron)
 static bool          g_detail    = false;
 static int           g_airspace_sel = 0;
 static bool          g_air_detail   = false;
@@ -132,7 +138,7 @@ static void gotoScreen(int s) {
     g_screen = s;
     g_paused = false; g_detail = false;
     g_scan_sel = 0;   g_scan_view = 0;
-    g_feed_scroll = 0; g_feed_manual = false;
+    g_feed_scroll = 0; g_feed_manual = false; g_dispN = 0;
     g_air_detail = false; g_airspace_sel = 0;
     g_popup_until = millis() + 1200;
   }
@@ -815,7 +821,6 @@ static void drawSignalBars(int x, int yBottom, int8_t rssi, uint16_t on);  // fo
 struct RfRow { uint8_t src; char id[24]; char mac[18]; int8_t rssi; uint8_t tracker; };
 
 static RfRow         g_disp[40];
-static int           g_dispN  = 0;
 static RfRow         g_detail_row{};
 
 static drone::BleSight g_bleFrozen[24];
@@ -877,7 +882,60 @@ static const char* trackerLabel(uint8_t t) {
   }
 }
 
+// --- persistent feed table: rows live in g_disp[]; updated in place, expired on a TTL, order stable ---
+static unsigned long g_disp_seen[40];
+
+static void feedUpsert(uint8_t src, uint8_t tracker, const char* id, const char* mac, int8_t rssi) {
+  for (int i = 0; i < g_dispN; ++i)
+    if (strncmp(g_disp[i].mac, mac, 17) == 0) {                 // already tracked -> update its slot in place
+      g_disp[i].src = src; g_disp[i].tracker = tracker; g_disp[i].rssi = rssi;
+      strncpy(g_disp[i].id, id, sizeof(g_disp[i].id)-1); g_disp[i].id[sizeof(g_disp[i].id)-1] = '\0';
+      g_disp_seen[i] = millis(); return;
+    }
+  if (g_dispN >= 40) return;                                    // new device -> append
+  int i = g_dispN++;
+  g_disp[i].src = src; g_disp[i].tracker = tracker; g_disp[i].rssi = rssi;
+  strncpy(g_disp[i].id,  id,  sizeof(g_disp[i].id)-1);  g_disp[i].id[sizeof(g_disp[i].id)-1]   = '\0';
+  strncpy(g_disp[i].mac, mac, sizeof(g_disp[i].mac)-1); g_disp[i].mac[sizeof(g_disp[i].mac)-1] = '\0';
+  g_disp_seen[i] = millis();
+}
+
+static void feedExpire(unsigned long ttl) {                     // drop devices unseen for > ttl, keep order
+  unsigned long now = millis(); int w = 0;
+  for (int r = 0; r < g_dispN; ++r)
+    if (now - g_disp_seen[r] <= ttl) {
+      if (w != r) { g_disp[w] = g_disp[r]; g_disp_seen[w] = g_disp_seen[r]; }
+      ++w;
+    }
+  g_dispN = w;
+}
+
+static void feedSortByFirstSeen() {                             // stable: first-seen is immutable per MAC
+  unsigned long fs[40];
+  for (int i = 0; i < g_dispN; ++i) { bool nw; fs[i] = rfFirstSeen(g_disp[i].mac, &nw); }
+  for (int i = 1; i < g_dispN; ++i) {
+    RfRow kr = g_disp[i]; unsigned long kf = fs[i], ks = g_disp_seen[i]; int j = i - 1;
+    while (j >= 0 && fs[j] < kf) { g_disp[j+1]=g_disp[j]; fs[j+1]=fs[j]; g_disp_seen[j+1]=g_disp_seen[j]; --j; }
+    g_disp[j+1] = kr; fs[j+1] = kf; g_disp_seen[j+1] = ks;
+  }
+}
+
+static void feedSortBleStable() {                               // trackers first, then first-seen (both stable)
+  unsigned long fs[40];
+  for (int i = 0; i < g_dispN; ++i) { bool nw; fs[i] = rfFirstSeen(g_disp[i].mac, &nw); }
+  for (int i = 0; i < g_dispN; ++i)
+    for (int j = i + 1; j < g_dispN; ++j) {
+      bool ti = g_disp[i].tracker != drone::TRK_NONE, tj = g_disp[j].tracker != drone::TRK_NONE;
+      if ((tj && !ti) || (ti == tj && fs[j] > fs[i])) {
+        RfRow t = g_disp[i]; g_disp[i] = g_disp[j]; g_disp[j] = t;
+        unsigned long a = fs[i]; fs[i] = fs[j]; fs[j] = a;
+        unsigned long b = g_disp_seen[i]; g_disp_seen[i] = g_disp_seen[j]; g_disp_seen[j] = b;
+      }
+    }
+}
+
 static void drawFeedList(const RfRow* rows, int n, int top, int win);   // defined below
+static bool isMuted(const char* mac);                                   // defined below
 
 static void drawBleScreen() {
   cv.fillRect(0, 0, W, H, BG);
@@ -885,37 +943,34 @@ static void drawBleScreen() {
   static unsigned long s_bleBuild = 0;
   if (!g_paused && (g_dispN == 0 || millis() - s_bleBuild > 250)) {
     drone::BleSight b[24]; size_t n = drone::bleSnapshot(b, 24);
-    for (size_t i = 0; i < n; ++i)
-      for (size_t j = i + 1; j < n; ++j) {
-        bool ti = b[i].tracker != drone::TRK_NONE, tj = b[j].tracker != drone::TRK_NONE;
-        if ((tj && !ti) || (ti == tj && b[j].rssi > b[i].rssi)) { auto t = b[i]; b[i] = b[j]; b[j] = t; }
-      }
-    int rn = (int)(n < 40 ? n : 40);
-    for (int i = 0; i < rn; ++i) {
+    for (size_t i = 0; i < n; ++i) {
       bool isTrk = b[i].tracker != drone::TRK_NONE;
       const char* vnd = b[i].name[0] ? b[i].name : bleVendor(b[i].company_id, b[i].has_mfr);
       const char* id  = isTrk ? trackerLabel(b[i].tracker) : (vnd ? vnd : b[i].mac);
-      RfRow& c = g_disp[i]; c.src = drone::SRC_BLE; c.tracker = b[i].tracker; c.rssi = b[i].rssi;
-      strncpy(c.id, id, sizeof(c.id)-1); c.id[sizeof(c.id)-1]='\0';
-      strncpy(c.mac, b[i].mac, sizeof(c.mac)-1); c.mac[sizeof(c.mac)-1]='\0';
+      feedUpsert(drone::SRC_BLE, b[i].tracker, id, b[i].mac, b[i].rssi);
     }
-    g_dispN = rn; s_bleBuild = millis();
+    feedExpire(5000);
+    feedSortBleStable();
+    s_bleBuild = millis();
   }
 
-  int trk = 0; for (int i = 0; i < g_dispN; ++i) if (g_disp[i].tracker != drone::TRK_NONE) trk++;
-  drawPillHeader("BLE", !g_paused, "");
-  char rp[16];
-  if      (trk == 0) snprintf(rp, sizeof(rp), "%d near", g_dispN);
-  else if (trk == 1) snprintf(rp, sizeof(rp), "1 tracker");
-  else               snprintf(rp, sizeof(rp), "%d trackers", trk);
-  uint16_t rpbg = trk ? rgb565(0xF0,0x5A,0x5A) : PILL_BG;
-  uint16_t rpfg = trk ? rgb565(0xFF,0xFF,0xFF) : FG;
-  fontSmall(); int rw = cv.textWidth(rp) + 16, rx = W - 6 - rw;
-  cv.fillSmoothRoundRect(rx, 5, rw, 18, 9, rpbg);
-  cv.setTextColor(rpfg, rpbg); cv.setTextDatum(middle_center);
-  cv.setClipRect(rx, 5, rw, 18); cv.drawString(rp, rx + rw / 2, 14); cv.clearClipRect();
+  int trk = 0; for (int i = 0; i < g_dispN; ++i) if (g_disp[i].tracker != drone::TRK_NONE && !isMuted(g_disp[i].mac)) trk++;
+  int ftop = trk ? 24 : 6;                       // tracker alert pushes the feed down only when present
+  drawFeedList(g_disp, g_dispN, ftop, H - ftop);
+  cv.fillRect(0, 0, W, ftop, BG);                // clean the strip above the feed
 
-  drawFeedList(g_disp, g_dispN, 28, H - 28);
+  if (trk) {                                     // self-effacing alert: hidden when no trackers around
+    const uint16_t RED = rgb565(0xF0,0x5A,0x5A);
+    char rp[20];
+    if (trk == 1) snprintf(rp, sizeof(rp), "1 tracker near");
+    else          snprintf(rp, sizeof(rp), "%d trackers near", trk);
+    fontSmall();
+    int rw = cv.textWidth(rp) + 26;
+    cv.fillSmoothRoundRect(6, 4, rw, 17, 8, RED);
+    cv.fillSmoothCircle(16, 12, 3, rgb565(0xFF,0xFF,0xFF));
+    cv.setTextColor(rgb565(0xFF,0xFF,0xFF), RED); cv.setTextDatum(middle_left);
+    cv.setClipRect(6, 4, rw, 17); cv.drawString(rp, 24, 12); cv.clearClipRect();
+  }
 }
 
 static uint16_t srcColor(uint8_t src) {
@@ -952,7 +1007,7 @@ static void drawFeedList(const RfRow* rows, int n, int top, int win) {
 
   unsigned long now = millis();
   float dt = g_feed_t ? (float)(now - g_feed_t) : 0.0f; g_feed_t = now;
-  if (dt > 100.0f) dt = 100.0f;
+  if (dt > 40.0f) dt = 40.0f;                       // a stalled frame can't lurch the scroll far
   if (g_feed_manual && now - g_feed_touch > 7000) g_feed_manual = false;
 
   int kVis = win / ROW; if (kVis < 1) kVis = 1;
@@ -968,9 +1023,11 @@ static void drawFeedList(const RfRow* rows, int n, int top, int win) {
     if ((g_scan_sel + 1) * ROW > tgt + win) tgt = (float)((g_scan_sel + 1) * ROW - win);
     if (tgt < 0) tgt = 0; if (tgt > maxS) tgt = maxS;
     g_feed_scroll += (tgt - g_feed_scroll) * (1.0f - expf(-dt / 80.0f));
-  } else if (ticker) {                              // steady downward flow, seamless wrap
-    g_feed_scroll += TICKER_PXPS * dt / 1000.0f;
+  } else if (ticker) {                              // tilt-controlled flow, seamless wrap both ways
+    g_feed_vel_eased += (g_feed_vel - g_feed_vel_eased) * (1.0f - expf(-dt / 110.0f));  // smooth speed
+    g_feed_scroll += g_feed_vel_eased * dt / 1000.0f;
     while (g_feed_scroll >= total) g_feed_scroll -= total;
+    while (g_feed_scroll <  0.0f)  g_feed_scroll += total;
   } else {
     g_feed_scroll = 0;
     if (g_scan_sel < 0) g_scan_sel = 0; if (g_scan_sel >= n) g_scan_sel = n - 1;
@@ -1020,65 +1077,48 @@ static void drawFeedList(const RfRow* rows, int n, int top, int win) {
     }
   }
   cv.clearClipRect();
+
+  if (g_tilt_scrub && ticker) {                     // faint chevron points the scrub direction
+    const uint16_t cc = rgb565(0x4A,0x4A,0x55);
+    int cxp = W / 2;
+    if (g_tilt_dir < 0) { int yy = top + 4;       cv.fillTriangle(cxp-7, yy+5, cxp+7, yy+5, cxp, yy, cc); }
+    else                { int yy = top + win - 5; cv.fillTriangle(cxp-7, yy-5, cxp+7, yy-5, cxp, yy, cc); }
+  }
 }
 
 static void drawScanScreen() {
   cv.fillRect(0, 0, W, H, BG);
 
   static unsigned long s_scanBuild = 0;
-  if (!g_paused && (g_dispN == 0 || millis() - s_scanBuild > 250)) {   // data 4 Hz; scroll renders at 30 fps
-    int rn = 0;
-    auto addWifi = [&](const char* ssid, const char* bssid, int8_t rssi, uint8_t src) {
-      if (rn >= 40) return;
-      if (ssid && ssid[0]) {
-        for (int j = 0; j < rn; ++j)
-          if (g_disp[j].src != drone::SRC_BLE && strncmp(g_disp[j].id, ssid, sizeof(g_disp[j].id)-1) == 0) {
-            if (rssi > g_disp[j].rssi) { g_disp[j].rssi = rssi; g_disp[j].src = src; } return; }
-      } else {
-        for (int j = 0; j < rn; ++j)
-          if (g_disp[j].src != drone::SRC_BLE && strncmp(g_disp[j].mac, bssid, 17) == 0) return;
-      }
-      RfRow& c = g_disp[rn++]; c.src = src; c.tracker = drone::TRK_NONE;
-      strncpy(c.id, (ssid && ssid[0]) ? ssid : "(hidden)", sizeof(c.id)-1); c.id[sizeof(c.id)-1]='\0';
-      strncpy(c.mac, bssid, sizeof(c.mac)-1); c.mac[sizeof(c.mac)-1]='\0';
-      c.rssi = rssi;
-    };
+  if (!g_paused && (g_dispN == 0 || millis() - s_scanBuild > 250)) {   // merge-refresh 4 Hz; scroll 30 fps
     char home_ssid[33]; home_ssid[0] = '\0';
     if (g_hide_home && WiFi.status() == WL_CONNECTED) {
       strncpy(home_ssid, WiFi.SSID().c_str(), sizeof(home_ssid)-1); home_ssid[sizeof(home_ssid)-1]='\0'; }
     for (int i = 0; i < g_ap_count; ++i) {
       if (!keepRow(drone::SRC_WIFI_2G, g_aps[i].rssi, g_aps[i].ssid, home_ssid)) continue;
-      addWifi(g_aps[i].ssid, g_aps[i].bssid, g_aps[i].rssi, drone::SRC_WIFI_2G);
+      feedUpsert(drone::SRC_WIFI_2G, drone::TRK_NONE,
+                 g_aps[i].ssid[0] ? g_aps[i].ssid : "(hidden)", g_aps[i].bssid, g_aps[i].rssi);
     }
     { drone::BleSight bs[24]; size_t nb = drone::bleSnapshot(bs, 24);
-      for (size_t i = 0; i < nb && rn < 40; ++i) {
+      for (size_t i = 0; i < nb; ++i) {
         const char* label = bs[i].name[0] ? bs[i].name : bleVendor(bs[i].company_id, bs[i].has_mfr);
         const char* id = label ? label : bs[i].mac;
         if (!keepRow(drone::SRC_BLE, bs[i].rssi, id, home_ssid)) continue;
-        RfRow& c = g_disp[rn++]; c.src = drone::SRC_BLE; c.tracker = bs[i].tracker;
-        strncpy(c.id, id, sizeof(c.id)-1); c.id[sizeof(c.id)-1]='\0';
-        strncpy(c.mac, bs[i].mac, sizeof(c.mac)-1); c.mac[sizeof(c.mac)-1]='\0';
-        c.rssi = bs[i].rssi;
+        feedUpsert(drone::SRC_BLE, bs[i].tracker, id, bs[i].mac, bs[i].rssi);
       } }
     { c5link::WifiSight ws[24]; size_t nw = c5link::wifiSnapshot(ws, 24);
       for (size_t i = 0; i < nw; ++i) {
         uint8_t src = (ws[i].band == 5) ? drone::SRC_WIFI_5G : drone::SRC_WIFI_2G;
         if (!keepRow(src, ws[i].rssi, ws[i].ssid, home_ssid)) continue;
-        addWifi(ws[i].ssid, ws[i].bssid, ws[i].rssi, src);
+        feedUpsert(src, drone::TRK_NONE, ws[i].ssid[0] ? ws[i].ssid : "(hidden)", ws[i].bssid, ws[i].rssi);
       } }
-    unsigned long fs[40];
-    for (int i = 0; i < rn; ++i) { bool nw2; fs[i] = rfFirstSeen(g_disp[i].mac, &nw2); }
-    for (int i = 1; i < rn; ++i) {
-      RfRow kr = g_disp[i]; unsigned long kf = fs[i]; int j = i - 1;
-      while (j >= 0 && fs[j] < kf) { g_disp[j+1] = g_disp[j]; fs[j+1] = fs[j]; --j; }
-      g_disp[j+1] = kr; fs[j+1] = kf;
-    }
-    g_dispN = rn; s_scanBuild = millis();
+    feedExpire(5000);
+    feedSortByFirstSeen();
+    s_scanBuild = millis();
   }
 
-  char cstr[16]; snprintf(cstr, sizeof(cstr), g_paused ? "%d paused" : "%d devices", g_dispN);
-  drawPillHeader("RF Scan", !g_paused, cstr);
-  drawFeedList(g_disp, g_dispN, 28, H - 28);
+  drawFeedList(g_disp, g_dispN, 6, H - 6);
+  cv.fillRect(0, 0, W, 6, BG);                  // trim any AA bleed at the very top edge
 }
 
 // ---------------------------------------------------------------------------
@@ -1102,67 +1142,169 @@ static const char* srcName(uint8_t s) {
                default:                  return "BLE"; }
 }
 
+// ---- small color lerp for the breathing dot / glow ----
+static uint16_t lerp565(uint16_t a, uint16_t b, float t) {
+  if (t < 0) t = 0; if (t > 1) t = 1;
+  int ar=(a>>11)&0x1F, ag=(a>>5)&0x3F, ab=a&0x1F;
+  int br=(b>>11)&0x1F, bg=(b>>5)&0x3F, bb=b&0x1F;
+  int r=ar+(int)((br-ar)*t+0.5f), g=ag+(int)((bg-ag)*t+0.5f), bl=ab+(int)((bb-ab)*t+0.5f);
+  return (uint16_t)((r<<11)|(g<<5)|bl);
+}
+
+static const char* trackerNetwork(uint8_t t) {
+  switch (t) {
+    case drone::TRK_AIRTAG:   return "APPLE FIND MY";
+    case drone::TRK_TILE:     return "TILE NETWORK";
+    case drone::TRK_SMARTTAG: return "SAMSUNG SMARTTHINGS";
+    default:                  return "FIND MY NETWORK";
+  }
+}
+
+// ---- per-MAC mute (suppresses the tracker alert for a while) ----
+static char          g_mute_mac[8][18];
+static unsigned long g_mute_until[8] = {0};
+static bool isMuted(const char* mac) {
+  unsigned long now = millis();
+  for (int i = 0; i < 8; ++i)
+    if (g_mute_until[i] > now && strncmp(g_mute_mac[i], mac, 17) == 0) return true;
+  return false;
+}
+static unsigned long muteRemaining(const char* mac) {
+  unsigned long now = millis();
+  for (int i = 0; i < 8; ++i)
+    if (g_mute_until[i] > now && strncmp(g_mute_mac[i], mac, 17) == 0) return g_mute_until[i] - now;
+  return 0;
+}
+static void muteAdd(const char* mac, unsigned long ms) {
+  unsigned long now = millis(); int slot = -1;
+  for (int i = 0; i < 8; ++i) { if (strncmp(g_mute_mac[i], mac, 17) == 0) { slot = i; break; }
+                                if (slot < 0 && g_mute_until[i] <= now) slot = i; }
+  if (slot < 0) slot = 0;
+  strncpy(g_mute_mac[slot], mac, 17); g_mute_mac[slot][17] = '\0';
+  g_mute_until[slot] = now + ms;
+}
+
 static void drawDetailScreen() {
-  cv.fillRect(0, 0, W, H, F_BG);
-  fontSmall(); cv.setTextDatum(middle_left);
-  cv.setTextColor(F_DIM, F_BG); cv.drawString("detail", 8, 11);
-  if (((millis() / 500) % 2) == 0) cv.fillSmoothCircle(W - 10, 11, 2, COL_OK);
-  cv.drawFastHLine(0, 22, W, F_HAIR);
-
   const RfRow& r = g_detail_row;
+  bool isTrk = (r.tracker != drone::TRK_NONE);
 
-  drawSrcBadge(8, 30, r.src);
-  fontBody(); cv.setTextDatum(top_left); cv.setTextColor(F_TEXT, F_BG);
-  cv.drawString(r.id[0] ? r.id : "(unknown)", 40, 28);
+  const uint16_t ACC    = isTrk ? COL_BAD : LILAC;
+  const uint16_t BANNER = isTrk ? rgb565(0x40,0x1E,0x22) : rgb565(0x24,0x21,0x3C);
+  const uint16_t NAMEC  = isTrk ? rgb565(0xF2,0xC6,0xC8) : FG;
+  const uint16_t SUBC   = isTrk ? rgb565(0xCE,0x74,0x78) : MUTE;
+  const uint16_t CARD2  = rgb565(0x16,0x14,0x18);
+  const uint16_t DIMBAR = isTrk ? rgb565(0x4C,0x30,0x34) : rgb565(0x34,0x31,0x42);
 
+  cv.fillRect(0, 0, W, H, BG);
+
+  // ---- live RSSI, EMA smoothing, peak, sparkline history, trend ----
   int8_t rssi; bool live = liveRssi(r.mac, r.src, &rssi);
-  // EMA-smooth the signal so 10 Hz refresh reads as a steady trend, not raw jitter.
-  // Resets when you switch contacts; holds (no snap) during brief dropouts.
-  static char  ema_mac[18] = "";
-  static float ema = -90.0f;
-  if (strncmp(ema_mac, r.mac, 17) != 0) {
-    strncpy(ema_mac, r.mac, sizeof(ema_mac) - 1); ema_mac[sizeof(ema_mac) - 1] = '\0';
-    ema = live ? (float)rssi : (float)r.rssi;       // seed on contact switch
+  static char  st_mac[18] = "";
+  static float ema = -90.0f, refEma = -90.0f;
+  static int8_t peak = -120, hist[40]; static int histN = 0;
+  static unsigned long lastPush = 0, refMs = 0;
+  if (strncmp(st_mac, r.mac, 17) != 0) {
+    strncpy(st_mac, r.mac, 17); st_mac[17] = '\0';
+    ema = live ? (float)rssi : (float)r.rssi;
+    peak = (int8_t)ema; histN = 0; lastPush = 0; refEma = ema; refMs = millis();
   } else if (live) {
-    ema += 0.25f * ((float)rssi - ema);             // ~0.4 s time constant @ 100 ms
+    ema += 0.25f * ((float)rssi - ema);
   }
+  if (live && (int8_t)ema > peak) peak = (int8_t)ema;
+  if (millis() - lastPush > 280) {
+    lastPush = millis();
+    if (histN < 40) hist[histN++] = (int8_t)ema;
+    else { memmove(hist, hist + 1, 39); hist[39] = (int8_t)ema; }
+  }
+  float trend = ema - refEma;
+  if (millis() - refMs > 900) { refEma = ema; refMs = millis(); }
   int rint = (int)lroundf(ema);
-  float frac = (ema + 90.0f) / 50.0f; if (frac < 0) frac = 0; if (frac > 1) frac = 1;
-  uint16_t sc = (rint >= -55) ? COL_OK : (rint >= -70) ? COL_HEAD : COL_BAD;
-  fontSmall(); cv.setTextDatum(top_left); cv.setTextColor(F_DIM, F_BG);
-  cv.drawString(live ? "signal" : "signal (last seen)", 8, 46);
-  int bx = 8, by = 56, bw = 180, bh = 18;
-  cv.drawRoundRect(bx, by, bw, bh, 3, F_HAIR);
-  if (frac > 0.02f) cv.fillSmoothRoundRect(bx, by, (int)(bw * frac), bh, 3, sc);
-  char rb[8]; snprintf(rb, sizeof(rb), "%d", rint);
-  fontBody(); cv.setTextDatum(middle_right); cv.setTextColor(sc, F_BG);
-  cv.drawString(rb, 232, by + bh / 2);
 
-  int y = 82; fontSmall();
-  auto field = [&](const char* k, const char* v, uint16_t vc) {
-    cv.setTextDatum(top_left);  cv.setTextColor(F_DIM, F_BG); cv.drawString(k, 8, y);
-    cv.setTextDatum(top_right); cv.setTextColor(vc,    F_BG); cv.drawString(v, W - 8, y);
-    y += 14;
-  };
-  field("mac", r.mac, F_TEXT);
-  if (r.src == drone::SRC_BLE) {
-    drone::BleSight bs[24]; size_t nb = drone::bleSnapshot(bs, 24);
-    for (size_t i = 0; i < nb; ++i)
-      if (strncmp(bs[i].mac, r.mac, 17) == 0) {
-        const char* v = bleVendor(bs[i].company_id, bs[i].has_mfr);
-        field("vendor", v ? v : "-", F_TEXT);
-        if (bs[i].tracker != drone::TRK_NONE) field("tracker", trackerLabel(bs[i].tracker), COL_BAD);
-        break;
-      }
-  } else {
-    field("band", r.src == drone::SRC_WIFI_5G ? "5 GHz" : "2.4 GHz", F_TEXT);
+  // ---- alert banner ----
+  const int bx = 5, by = 4, bw = W - 10, bh = 34;
+  cv.fillSmoothRoundRect(bx, by, bw, bh, 11, BANNER);
+  float pulse = 0.5f + 0.5f * sinf(millis() * 0.005f);                 // breathing dot
+  uint16_t dotc = live ? lerp565(BANNER, ACC, 0.12f + 0.88f * pulse) : lerp565(BANNER, ACC, 0.35f);
+  cv.fillSmoothCircle(bx + 15, by + bh / 2, 4, dotc);
+  fontBody(); cv.setTextDatum(top_left); cv.setTextColor(NAMEC, BANNER);
+  cv.setClipRect(bx + 27, by, 150, bh);
+  cv.drawString(r.id[0] ? r.id : "(unknown)", bx + 27, by + 4);
+  cv.clearClipRect();
+  fontSmall(); cv.setTextDatum(top_left); cv.setTextColor(SUBC, BANNER);
+  cv.drawString(isTrk ? trackerNetwork(r.tracker) : srcName(r.src), bx + 27, by + 20);
+  fontBody(); cv.setTextDatum(middle_right); cv.setTextColor(ACC, BANNER);
+  cv.drawString(isTrk ? "TRACKING" : "SIGNAL", bx + bw - 12, by + bh / 2);
+
+  // ---- left card: signal bars, dBm, closer/farther ----
+  const int lx = 5, ly = 42, lw = 138, lh = 50;
+  cv.fillSmoothRoundRect(lx, ly, lw, lh, 10, CARD2);
+  int bars = (int)lroundf((ema + 100.0f) / 12.0f); if (bars < 0) bars = 0; if (bars > 5) bars = 5;
+  int barBottom = ly + 30, barX = lx + 14;
+  for (int i = 0; i < 5; ++i) {
+    int hh = 6 + i * 4, x = barX + i * 8, yy = barBottom - hh;
+    cv.fillSmoothRoundRect(x, yy, 5, hh, 1, (i < bars) ? ACC : DIMBAR);
   }
-  bool nw = false; unsigned long fs = rfFirstSeen(r.mac, &nw);
-  char age[12]; snprintf(age, sizeof(age), "%lus", fs ? (millis() - fs) / 1000 : 0UL);
-  field("seen for", age, F_TEXT);
+  char dbm[12]; snprintf(dbm, sizeof(dbm), "%d dBm", rint);
+  fontBody(); cv.setTextDatum(bottom_left); cv.setTextColor(live ? FG : MUTE, CARD2);
+  cv.drawString(dbm, lx + 14, ly + lh - 8);
+  int ax = lx + 104, ay = ly + 19;
+  const char* dirw; uint16_t dirc;
+  if      (trend >  2.0f) { dirw = "closer";  dirc = ACC;
+    cv.fillTriangle(ax-7, ay+2, ax+7, ay+2, ax, ay-8, dirc); cv.fillRect(ax-2, ay+2, 4, 8, dirc); }
+  else if (trend < -2.0f) { dirw = "farther"; dirc = isTrk ? COL_HEAD : MUTE;
+    cv.fillTriangle(ax-7, ay-2, ax+7, ay-2, ax, ay+8, dirc); cv.fillRect(ax-2, ay-8, 4, 8, dirc); }
+  else                    { dirw = "holding"; dirc = MUTE;
+    cv.fillRect(ax-7, ay-1, 14, 3, dirc); }
+  fontBody(); cv.setTextDatum(top_center); cv.setTextColor(dirc, CARD2);
+  cv.drawString(dirw, ax, ly + lh - 22);
 
-  cv.setTextDatum(bottom_center); cv.setTextColor(F_DIM, F_BG);
-  cv.drawString("BtnB next   BtnA back", W / 2, H - 3);
+  // ---- right card: RSSI sparkline + closest distance ----
+  const int rx = lx + lw + 4, ry = 42, rh = 50, rw = W - 5 - rx;
+  cv.fillSmoothRoundRect(rx, ry, rw, rh, 10, CARD2);
+  int gx0 = rx + 8, gx1 = rx + rw - 8, gy0 = ry + 8, gy1 = ry + 30;
+  if (histN >= 2) {
+    auto ymap = [&](int8_t v){ float t=((float)v+90.0f)/50.0f; if(t<0)t=0; if(t>1)t=1; return (int)(gy1-t*(gy1-gy0)); };
+    int px = gx0, py = ymap(hist[0]);
+    for (int i = 1; i < histN; ++i) {
+      int cx = gx0 + (gx1 - gx0) * i / (histN - 1), cy = ymap(hist[i]);
+      cv.drawLine(px, py, cx, cy, ACC); cv.drawLine(px, py+1, cx, cy+1, ACC);
+      px = cx; py = cy;
+    }
+    cv.fillSmoothCircle(px, py, 5, lerp565(CARD2, ACC, 0.35f));
+    cv.fillSmoothCircle(px, py, 3, ACC);
+  } else {
+    fontSmall(); cv.setTextDatum(middle_center); cv.setTextColor(MUTE, CARD2);
+    cv.drawString("sampling", (gx0 + gx1) / 2, (gy0 + gy1) / 2);
+  }
+  float dm = powf(10.0f, ((float)(-59) - (float)peak) / 25.0f);
+  char cm[16];
+  if (dm < 1.0f) snprintf(cm, sizeof(cm), "closest <1 m");
+  else           snprintf(cm, sizeof(cm), "closest %d m", (int)lroundf(dm));
+  fontSmall(); cv.setTextDatum(bottom_center); cv.setTextColor(MUTE, CARD2);
+  cv.drawString(cm, rx + rw / 2, ry + rh - 8);
+
+  // ---- bottom: id + co-presence, and the mute / back pill ----
+  bool nw = false; unsigned long fs = rfFirstSeen(r.mac, &nw);
+  unsigned long secs = fs ? (millis() - fs) / 1000 : 0;
+  char idline[44];
+  if (secs >= 60) snprintf(idline, sizeof(idline), "id %.11s  \xB7  with you %lum", r.mac, secs / 60);
+  else            snprintf(idline, sizeof(idline), "id %.11s  \xB7  with you %lus", r.mac, secs);
+
+  fontSmall();
+  char pill[18]; uint16_t pbg, pfg;
+  unsigned long mrem = muteRemaining(r.mac);
+  if      (mrem)  { snprintf(pill, sizeof(pill), "muted %lum", mrem / 60000UL + 1); pbg = rgb565(0x33,0x33,0x3C); pfg = MUTE; }
+  else if (isTrk) { snprintf(pill, sizeof(pill), "hold B \xB7 mute 1h");             pbg = rgb565(0x5A,0x4E,0x86); pfg = rgb565(0xFF,0xFF,0xFF); }
+  else            { snprintf(pill, sizeof(pill), "hold A \xB7 back");                pbg = rgb565(0x2A,0x2A,0x33); pfg = MUTE; }
+  int pw = cv.textWidth(pill) + 18, ppx = W - 6 - pw, ppy = 96;
+  cv.fillSmoothRoundRect(ppx, ppy, pw, 19, 9, pbg);
+  cv.setTextColor(pfg, pbg); cv.setTextDatum(middle_center);
+  cv.setClipRect(ppx, ppy, pw, 19); cv.drawString(pill, ppx + pw / 2, ppy + 10); cv.clearClipRect();
+
+  cv.setTextDatum(middle_left); cv.setTextColor(MUTE, BG);
+  cv.setClipRect(6, ppy, ppx - 12, 19);
+  cv.drawString(idline, 8, ppy + 10);
+  cv.clearClipRect();
 }
 
 // ---------------------------------------------------------------------------
@@ -1346,8 +1488,9 @@ void loop() {
 
   // BtnA click: scroll screens (always)
   if (M5.BtnA.wasClicked()) {
-    if (g_portal_active) stopConfigPortal();
-    else                 gotoScreen(g_screen + 1);
+    if      (g_portal_active) stopConfigPortal();
+    else if (g_detail)        g_detail = false;          // back to the list
+    else                      gotoScreen(g_screen + 1);
     render();
   }
 
@@ -1381,9 +1524,11 @@ void loop() {
         services::adsb::setCenter(g_cfg.lat, g_cfg.lon, rangeKm() * 1.3f);
       }
     } else if (g_screen == SCR_SCAN || g_screen == SCR_BLE) {
-      g_feed_manual = true; g_feed_touch = millis();
-      if (g_detail) { g_detail = false; }
-      else if (g_dispN > 0) {
+      if (g_detail) {
+        if (g_detail_row.tracker != drone::TRK_NONE) muteAdd(g_detail_row.mac, 3600000UL);  // mute 1h
+        else g_detail = false;
+      } else if (g_dispN > 0) {
+        g_feed_manual = true; g_feed_touch = millis();
         int s = g_scan_sel; if (s < 0) s = 0; if (s >= g_dispN) s = g_dispN - 1;
         g_detail_row = g_disp[s]; g_detail = true;
       }
@@ -1413,7 +1558,7 @@ void loop() {
   static unsigned long last_imu    = 0;
   static float         gx = 0, gy = 0, gz = 0;  // low-pass gravity estimate
   static float         last_mag    = 1.0f;
-  if (now - last_imu > 100) {
+  if (now - last_imu > 50) {
     last_imu = now;
     float ax, ay, az;
     M5.Imu.update();
@@ -1421,7 +1566,7 @@ void loop() {
     const float k = 0.15f;
     gx += k * (ax - gx); gy += k * (ay - gy); gz += k * (az - gz);
     float h = (fabsf(gx) >= fabsf(gy)) ? gx : gy;  // dominant horizontal axis
-    if (fabsf(h) > 0.5f) {                           // only when clearly landscape
+    if (fabsf(h) > 0.5f && g_screen != SCR_SCAN && g_screen != SCR_BLE) {   // not while tilt-scrubbing a feed
       static int rot = 1;
       int want = (h > 0) ? 1 : 3;                    // swap 1 and 3 if screen ends up upside-down
       if (want != rot) { rot = want; M5.Display.setRotation(rot); render(); }
@@ -1429,6 +1574,30 @@ void loop() {
     float mag = sqrtf(ax*ax + ay*ay + az*az);
     if (fabsf(mag - last_mag) > 0.06f) g_last_motion = now;
     last_mag = mag;
+
+    // ---- tilt-shuttle: pitch sets feed scroll velocity ----
+    {
+      const float TILT_SIGN = 1.0f;     // set -1 if forward tilt scrolls the wrong way
+      const float TILT_DEAD = 0.18f;    // wider neutral band, ~11 deg
+      const float TILT_SENS = 600.0f;   // px/s per g past the deadzone
+      float tilt = TILT_SIGN * gx;      // LEFT-RIGHT (roll) axis = gx; if it does nothing, try gy or gz
+      if (g_tilt_neutral > 90.0f) g_tilt_neutral = tilt;          // first-run seed
+      if ((g_screen == SCR_SCAN || g_screen == SCR_BLE) && !g_detail && !g_paused) {
+        float e = tilt - g_tilt_neutral;
+        if (e > TILT_DEAD) {                                      // tip forward -> faster down
+          g_feed_vel = TICKER_PXPS + (e - TILT_DEAD) * TILT_SENS; g_tilt_scrub = true; g_tilt_dir = 1;
+        } else if (e < -TILT_DEAD) {                             // tip back -> reverse (up)
+          g_feed_vel = -((-e - TILT_DEAD) * TILT_SENS);          g_tilt_scrub = true; g_tilt_dir = -1;
+        } else {                                                 // neutral -> normal auto ticker
+          g_feed_vel = TICKER_PXPS;                              g_tilt_scrub = false; g_tilt_dir = 0;
+        }
+        if (g_feed_vel >  300.0f) g_feed_vel =  300.0f;
+        if (g_feed_vel < -300.0f) g_feed_vel = -300.0f;
+        g_tilt_neutral += (g_tilt_scrub ? 0.008f : 0.05f) * (tilt - g_tilt_neutral);  // re-center
+      } else {
+        g_feed_vel = TICKER_PXPS; g_tilt_scrub = false; g_tilt_dir = 0;
+      }
+    }
   }
 
   static unsigned long last_batt = 0;
@@ -1497,7 +1666,7 @@ void loop() {
   }
 
   static unsigned long last_feed = 0;
-  if ((g_screen == SCR_SCAN || g_screen == SCR_BLE) && !g_detail && now - last_feed > 33) {
+  if ((g_screen == SCR_SCAN || g_screen == SCR_BLE) && !g_detail && now - last_feed > 24) {
     last_feed = now; render();
   }
   static unsigned long last_air = 0;
