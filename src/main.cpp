@@ -25,6 +25,7 @@
 #include <WebServer.h>
 #include "esp32-hal-cpu.h"
 #include <esp_sleep.h>
+#include "esp_wifi.h"
 #include <climits>
 #include "fonts/pjs_small.h"
 #include "fonts/pjs_body.h"
@@ -100,6 +101,13 @@ static const char* screenName(int s) {
 static int           g_scan_sel  = 0;
 static int           g_scan_view = 0;
 static bool          g_paused    = false;
+static constexpr float DRIFT_PXPS  = 10.0f;
+static float         g_feed_scroll = 0.0f;
+static float         g_feed_glide  = 0.0f;
+static unsigned long g_feed_t      = 0;
+static int           g_feed_dir    = 1;
+static bool          g_feed_manual = false;
+static unsigned long g_feed_touch  = 0;
 static bool          g_detail    = false;
 static int           g_airspace_sel = 0;
 static bool          g_air_detail   = false;
@@ -107,7 +115,7 @@ static unsigned long g_last_motion = 0;
 static float         g_bri         = 90.0f;
 static int           g_mv_cache    = 4000;
 static bool          g_usb_cache   = false;
-static constexpr int BRI_HI = 90;
+static constexpr int BRI_HI = 60;
 static constexpr int BRI_LO = 12;
 struct AContact {
   bool  is_drone; float dist_m, brg_deg;
@@ -124,6 +132,7 @@ static void gotoScreen(int s) {
     g_screen = s;
     g_paused = false; g_detail = false;
     g_scan_sel = 0;   g_scan_view = 0;
+    g_feed_scroll = 0; g_feed_glide = 0; g_feed_manual = false;
     g_air_detail = false; g_airspace_sel = 0;
     g_popup_until = millis() + 1200;
   }
@@ -345,15 +354,23 @@ static void drawTypeBadge(int x, int cy, uint8_t src, bool onSel = false) {
   cv.clearClipRect();
 }
 
-static void drawPillHeader(const char* title, bool liveDot, const char* rightText) {
+static void drawPillHeader(const char* title, bool liveDot, const char* rightText, bool center = false) {
   int ph = 18, py = 5, px = 6, dot = liveDot ? 9 : 0;
-  fontBody();
+  fontSmall();
   int pw = cv.textWidth(title) + 16 + dot;
   cv.fillSmoothRoundRect(px, py, pw, ph, ph / 2, HEAD_BG);
-  if (liveDot) cv.fillSmoothCircle(px + 11, py + ph / 2, 2, MUTE);
-  cv.setTextColor(HEAD_FG, HEAD_BG); cv.setTextDatum(middle_left);
+  cv.setTextColor(HEAD_FG, HEAD_BG);
   cv.setClipRect(px, py, pw, ph);
-  cv.drawString(title, px + 8 + dot, py + ph / 2);
+  if (center) {
+    int cx = px + pw / 2, tw = cv.textWidth(title);
+    cv.setTextDatum(middle_center);
+    cv.drawString(title, cx, py + ph / 2);
+    if (liveDot) cv.fillSmoothCircle(cx - tw / 2 - 6, py + ph / 2, 2, MUTE);
+  } else {
+    if (liveDot) cv.fillSmoothCircle(px + 11, py + ph / 2, 2, MUTE);
+    cv.setTextDatum(middle_left);
+    cv.drawString(title, px + 8 + dot, py + ph / 2);
+  }
   cv.clearClipRect();
   if (rightText && rightText[0]) {
     fontSmall();
@@ -517,13 +534,13 @@ static void drawAirspaceScreen() {
   if (g_airspace_sel >= n) g_airspace_sel = (n > 0) ? n - 1 : 0;
 
   // ---- header: AIRSPACE pill + lilac "N contacts" ----
-  drawPillHeader("Airspace", true, "");
+  drawPillHeader("Airspace", true, "", true);
   { char cc[14]; snprintf(cc, sizeof(cc), "%d contacts", n);
     fontSmall(); int rw = cv.textWidth(cc) + 16, rx = W - 6 - rw;
     cv.fillSmoothRoundRect(rx, 5, rw, 18, 9, LILAC);
     cv.setTextColor(HEAD_FG, LILAC); cv.setTextDatum(middle_center);
     cv.setClipRect(rx, 5, rw, 18); cv.drawString(cc, rx + rw / 2, 14); cv.clearClipRect(); }
-  if (g_paused) { fontBody(); int tr = 6 + cv.textWidth("Airspace") + 16;
+  if (g_paused) { fontSmall(); int tr = 6 + cv.textWidth("Airspace") + 16;
     cv.fillRect(tr + 8, 8, 3, 10, LILAC); cv.fillRect(tr + 13, 8, 3, 10, LILAC); }
 
   // ================= RADAR =================
@@ -656,39 +673,57 @@ static void drawStubScreen(const char* title, const char* note) {
 // STATS (battery / temperature / system)
 // ---------------------------------------------------------------------------
 static void drawStatsScreen() {
-  drawTopBar("Stats");
-  cv.setTextDatum(top_left);
-  fontSmall();
-  int y = CONTENT_Y + 4;
-  char line[44];
+  cv.fillRect(0, 0, W, H, BG);
+  drawPillHeader("Stats", false, "");        // bare title pill (battery is its own tile)
 
-  float c = temperatureRead();                 // ESP32-S3 die temp (reads hotter than the case)
-  float f = c * 9.0f / 5.0f + 32.0f;
-  cv.setTextColor(f >= 149.0f ? COL_BAD : COL_OK, COL_BG);   // 149F = 65C
-  snprintf(line, sizeof(line), "CHIP TEMP   %.0f F", f);
-  cv.drawString(line, 8, y); y += 15;
+  // ---- readings ----
+  float c   = temperatureRead();
+  float f   = c * 9.0f / 5.0f + 32.0f;
+  int   mv  = M5.Power.getBatteryVoltage();
+  int   lvl = battPctFromMv(mv);
+  bool  wup = (WiFi.status() == WL_CONNECTED);
+  int   rssi = wup ? (int)WiFi.RSSI() : 0;
 
-  cv.setTextColor(COL_TEXT, COL_BG);
-  int mv  = M5.Power.getBatteryVoltage();
-  int lvl = battPctFromMv(mv);
-  snprintf(line, sizeof(line), "BATTERY     %d%%", lvl);        cv.drawString(line, 8, y); y += 13;
-  snprintf(line, sizeof(line), "VOLTAGE     %.2f V", mv / 1000.0f); cv.drawString(line, 8, y); y += 13;
+  char nTemp[8], nBat[8], nVolt[8], nWifi[8];
+  snprintf(nTemp, sizeof(nTemp), "%.0f", f);
+  snprintf(nBat,  sizeof(nBat),  "%d",   lvl);
+  snprintf(nVolt, sizeof(nVolt), "%.2f", mv / 1000.0f);
+  snprintf(nWifi, sizeof(nWifi), wup ? "%d" : "--", rssi);
 
-  unsigned long up = millis() / 1000;
-  snprintf(line, sizeof(line), "UPTIME      %lum %lus", up / 60, up % 60); cv.drawString(line, 8, y); y += 13;
+  const uint16_t T_GREEN  = rgb565(0x2E,0x81,0x59);
+  const uint16_t T_PURPLE = rgb565(0x5A,0x4E,0x86);
+  const uint16_t T_TEAL   = rgb565(0x2D,0x6E,0x7C);
+  const uint16_t T_BROWN  = rgb565(0x7A,0x57,0x33);
+  const uint16_t U_FG = rgb565(0xCE,0xD2,0xDC);
+  const uint16_t L_FG = rgb565(0xBC,0xC0,0xCC);
 
-  if (WiFi.status() == WL_CONNECTED) {
-    snprintf(line, sizeof(line), "WIFI        %d dBm", (int)WiFi.RSSI());
-    cv.drawString(line, 8, y);
-  } else {
-    cv.setTextColor(COL_BAD, COL_BG);
-    cv.drawString("WIFI        offline", 8, y);
-  }
+  // ---- even 6 px padding everywhere; header occupies y5..23 ----
+  const int P   = 6;
+  const int top = 29;                          // header bottom (23) + P
+  const int tw  = (W - P * 3) / 2;             // 111
+  const int th  = (H - top - P - P) / 2;       // (135-29-6-6)/2 = 47
+  const int x1  = P, x2 = P + tw + P;
+  const int y1  = top, y2 = top + th + P;
 
-  char cTemp[10], cBat[10];
-  snprintf(cTemp, sizeof(cTemp), "%.0fF", f);
-  snprintf(cBat,  sizeof(cBat),  "%d%%", lvl);
-  drawBottomBar(cBat, cTemp, "STATS");
+  auto tile = [&](int x, int y, uint16_t bg, uint16_t numCol,
+                  const char* num, const char* unit, const char* label) {
+    cv.fillSmoothRoundRect(x, y, tw, th, 10, bg);
+    fontNum(); cv.setTextDatum(top_left); cv.setTextColor(numCol, bg);
+    cv.drawString(num, x + 12, y);             // number anchored to tile top
+    int nw = cv.textWidth(num);
+    if (unit && unit[0]) {
+      fontSmall(); cv.setTextDatum(bottom_left); cv.setTextColor(U_FG, bg);
+      cv.drawString(unit, x + 12 + nw + 5, y + 24);   // unit as a superscript
+    }
+    fontSmall(); cv.setTextDatum(top_left); cv.setTextColor(L_FG, bg);
+    cv.drawString(label, x + 12, y + th - 14); // label anchored to tile bottom
+  };
+
+  uint16_t tempCol = (f >= 149.0f) ? COL_BAD : FG;   // overheat flag
+  tile(x1, y1, T_GREEN,  tempCol, nTemp, "\xB0""F", "CHIP TEMP");
+  tile(x2, y1, T_PURPLE, FG,      nBat,  "%",       "BATTERY");
+  tile(x1, y2, T_TEAL,   FG,      nVolt, "V",       "VOLTAGE");
+  tile(x2, y2, T_BROWN,  FG,      nWifi, wup ? "dBm" : "", "WIFI");
 }
 
 // ---------------------------------------------------------------------------
@@ -727,8 +762,8 @@ static void drawConnScreen() {
   if (c5up) snprintf(kb, sizeof(kb), "%.1f KB/s", s_kbps); else snprintf(kb, sizeof(kb), "--");
   fontSmall(); cv.setTextDatum(top_left); cv.setTextColor(hsub, hbg);
   cv.drawString(c5up ? "linked \xB7 5 GHz radio" : "no link", hx + 24, hy + 25);
-  fontBody(); cv.setTextDatum(middle_right); cv.setTextColor(c5up ? FG : MUTE, hbg);
-  cv.drawString(kb, hx + hw - 10, hy + 30);
+  fontSmall(); cv.setTextDatum(top_right); cv.setTextColor(c5up ? FG : MUTE, hbg);
+  cv.drawString(kb, hx + hw - 10, hy + 25);
 
   // ---- 2x2 grid ----
   auto tile = [&](int x, int y, int w, int h, const char* label, uint16_t dot, const char* val) {
@@ -824,93 +859,46 @@ static const char* trackerLabel(uint8_t t) {
   }
 }
 
+static void drawFeedList(const RfRow* rows, int n, int top, int win);   // defined below
+
 static void drawBleScreen() {
   cv.fillRect(0, 0, W, H, BG);
 
-  static drone::BleSight g_bleFrozen[24];
-  static size_t g_bleFrozenN = 0;
-
-  drone::BleSight b[24];
-  size_t n;
-  if (g_paused) {
-    n = g_bleFrozenN;
-    for (size_t i = 0; i < n; ++i) b[i] = g_bleFrozen[i];
-  } else {
-    n = drone::bleSnapshot(b, 24);
+  RfRow sr[40]; int nc = 0;
+  if (g_paused) { nc = g_dispN; for (int i = 0; i < nc; ++i) sr[i] = g_disp[i]; }
+  else {
+    drone::BleSight b[24]; size_t n = drone::bleSnapshot(b, 24);
     for (size_t i = 0; i < n; ++i)
       for (size_t j = i + 1; j < n; ++j) {
         bool ti = b[i].tracker != drone::TRK_NONE, tj = b[j].tracker != drone::TRK_NONE;
         if ((tj && !ti) || (ti == tj && b[j].rssi > b[i].rssi)) { auto t = b[i]; b[i] = b[j]; b[j] = t; }
       }
-    g_bleFrozenN = n;
-    for (size_t i = 0; i < n; ++i) g_bleFrozen[i] = b[i];
+    nc = (int)n;
+    for (int i = 0; i < nc; ++i) {
+      bool isTrk = b[i].tracker != drone::TRK_NONE;
+      const char* vnd = b[i].name[0] ? b[i].name : bleVendor(b[i].company_id, b[i].has_mfr);
+      const char* id  = isTrk ? trackerLabel(b[i].tracker) : (vnd ? vnd : b[i].mac);
+      sr[i].src = drone::SRC_BLE; sr[i].tracker = b[i].tracker; sr[i].rssi = b[i].rssi;
+      strncpy(sr[i].id, id, sizeof(sr[i].id)-1); sr[i].id[sizeof(sr[i].id)-1]='\0';
+      strncpy(sr[i].mac, b[i].mac, sizeof(sr[i].mac)-1); sr[i].mac[sizeof(sr[i].mac)-1]='\0';
+    }
+    for (int i = 0; i < nc; ++i) g_disp[i] = sr[i]; g_dispN = nc;
   }
-  size_t trk = 0; for (size_t i = 0; i < n; ++i) if (b[i].tracker != drone::TRK_NONE) ++trk;
 
-  // header: light "BLE" pill + red "N trackers" pill (neutral when none)
-  drawPillHeader("BLE", false, "");
+  int trk = 0; for (int i = 0; i < nc; ++i) if (sr[i].tracker != drone::TRK_NONE) trk++;
+  drawPillHeader("BLE", !g_paused, "");
   char rp[16];
-  if      (trk == 0) snprintf(rp, sizeof(rp), "%u near", (unsigned)n);
+  if      (trk == 0) snprintf(rp, sizeof(rp), "%d near", nc);
   else if (trk == 1) snprintf(rp, sizeof(rp), "1 tracker");
-  else               snprintf(rp, sizeof(rp), "%u trackers", (unsigned)trk);
+  else               snprintf(rp, sizeof(rp), "%d trackers", trk);
   uint16_t rpbg = trk ? rgb565(0xF0,0x5A,0x5A) : PILL_BG;
   uint16_t rpfg = trk ? rgb565(0xFF,0xFF,0xFF) : FG;
   fontSmall(); int rw = cv.textWidth(rp) + 16, rx = W - 6 - rw;
   cv.fillSmoothRoundRect(rx, 5, rw, 18, 9, rpbg);
   cv.setTextColor(rpfg, rpbg); cv.setTextDatum(middle_center);
-  cv.setClipRect(rx, 5, rw, 18);
-  cv.drawString(rp, rx + rw / 2, 14);
-  cv.clearClipRect();
+  cv.setClipRect(rx, 5, rw, 18); cv.drawString(rp, rx + rw / 2, 14); cv.clearClipRect();
 
-  if (g_paused) {
-    fontBody(); int tr = 6 + cv.textWidth("BLE") + 16;
-    cv.fillRect(tr + 8, 8, 3, 10, LILAC); cv.fillRect(tr + 13, 8, 3, 10, LILAC);
-  }
-
-  if (n == 0) {
-    cv.setTextDatum(middle_center); cv.setTextColor(MUTE, BG); fontSmall();
-    cv.drawString("watching ble...", W / 2, H / 2 + 6);
-    return;
-  }
-
-  const uint16_t TRK_BG  = rgb565(0x3A,0x1E,0x22);
-  const uint16_t TRK_DOT = rgb565(0xF0,0x5A,0x5A);
-  const uint16_t TRK_FG  = rgb565(0xEE,0x8C,0x8C);
-  const uint16_t TRK_SUB = rgb565(0xE8,0x6E,0x6E);
-
-  unsigned long now = millis();
-  int shown = (int)(n < 4 ? n : 4);
-  cv.setClipRect(0, F_TOP, W, F_WIN_H);
-  for (int i = 0; i < shown; ++i) {
-    int y = F_TOP + i * F_ROW_H, cy = y + (F_ROW_H - 4) / 2;
-    bool isTrk = b[i].tracker != drone::TRK_NONE;
-    uint16_t rbg = isTrk ? TRK_BG : CARD;
-    cv.fillSmoothRoundRect(4, y, 232, F_ROW_H - 4, 8, rbg);
-
-    const char* vnd = b[i].name[0] ? b[i].name : bleVendor(b[i].company_id, b[i].has_mfr);
-    const char* label = isTrk ? trackerLabel(b[i].tracker) : (vnd ? vnd : b[i].mac);
-    int nameX = 14;
-    if (isTrk) { cv.fillSmoothCircle(16, cy, 4, TRK_DOT); nameX = 30; }
-
-    char rs[8]; snprintf(rs, sizeof(rs), "%d", b[i].rssi);
-    fontSmall(); cv.setTextDatum(middle_right);
-    cv.setTextColor(isTrk ? TRK_SUB : MUTE, rbg); cv.drawString(rs, 226, cy);
-    int rightEdge = 226 - cv.textWidth(rs) - 8;
-
-    if (isTrk) {
-      char dur[20]; snprintf(dur, sizeof(dur), "following %lus", (now - b[i].first_seen_ms) / 1000);
-      cv.setTextDatum(middle_right); cv.setTextColor(TRK_SUB, rbg);
-      cv.drawString(dur, rightEdge, cy);
-      rightEdge -= cv.textWidth(dur) + 8;
-    }
-
-    int nameW = rightEdge - nameX;
-    cv.setClipRect(nameX, F_TOP, nameW > 0 ? nameW : 0, F_WIN_H);
-    fontBody(); cv.setTextDatum(middle_left);
-    cv.setTextColor(isTrk ? TRK_FG : FG, rbg); cv.drawString(label, nameX, cy);
-    cv.setClipRect(0, F_TOP, W, F_WIN_H);
-  }
-  cv.clearClipRect();
+  drawFeedList(sr, nc, 25, H - 25);
 }
 
 static uint16_t srcColor(uint8_t src) {
@@ -933,143 +921,140 @@ static void drawSignalBars(int x, int yBottom, int8_t rssi, uint16_t on) {
     cv.fillRect(x + i * 8, yBottom - h[i], 6, h[i], (i < lvl) ? on : F_HAIR);
 }
 
-static void drawScanScreen() {
-  cv.fillRect(0, 0, W, H, F_BG);
+// One flowing feed for both RF Scan and BLE. rows[] already sorted newest-first.
+static void drawFeedList(const RfRow* rows, int n, int top, int win) {
+  const int ROW = F_ROW_H;
+  const uint16_t TRK_DOT = rgb565(0xF0,0x5A,0x5A);
+  const uint16_t TRK_BG  = rgb565(0x3A,0x1E,0x22);
+  const uint16_t TRK_FG  = rgb565(0xEE,0x8C,0x8C);
 
-  RfRow rows[40]; int nc = 0;
-  if (g_paused) { nc = g_dispN; for (int i = 0; i < nc; ++i) rows[i] = g_disp[i]; }
-
-  // Collapse a WiFi network to ONE row: merge by SSID (mesh APs share a name);
-  // dedup hidden networks by BSSID. Keep the first BSSID (stable identity for the
-  // slide animation) and upgrade to the strongest RSSI/band seen for that name.
-  auto addWifi = [&](const char* ssid, const char* bssid, int8_t rssi, uint8_t src) {
-    if (nc >= 40) return;
-    if (ssid && ssid[0]) {
-      for (int j = 0; j < nc; ++j)
-        if (rows[j].src != drone::SRC_BLE &&
-            strncmp(rows[j].id, ssid, sizeof(rows[j].id) - 1) == 0) {
-          if (rssi > rows[j].rssi) { rows[j].rssi = rssi; rows[j].src = src; }
-          return;
-        }
-    } else {
-      for (int j = 0; j < nc; ++j)
-        if (rows[j].src != drone::SRC_BLE && strncmp(rows[j].mac, bssid, 17) == 0) return;
-    }
-    RfRow& c = rows[nc++]; c.src = src;
-    strncpy(c.id, (ssid && ssid[0]) ? ssid : "(hidden)", sizeof(c.id) - 1); c.id[sizeof(c.id) - 1] = '\0';
-    strncpy(c.mac, bssid, sizeof(c.mac) - 1); c.mac[sizeof(c.mac) - 1] = '\0';
-    c.rssi = rssi;
-  };
-
-  char home_ssid[33]; home_ssid[0] = '\0';
-  if (g_hide_home && WiFi.status() == WL_CONNECTED) {
-    strncpy(home_ssid, WiFi.SSID().c_str(), sizeof(home_ssid) - 1);
-    home_ssid[sizeof(home_ssid) - 1] = '\0';
+  if (n <= 0) {
+    fontSmall(); cv.setTextDatum(middle_center); cv.setTextColor(MUTE, BG);
+    cv.drawString("watching...", W / 2, top + win / 2);
+    g_feed_scroll = 0; g_feed_glide = 0; return;
   }
 
-  if (!g_paused) {
-    // native WiFi APs — StickS3 radio is 2.4 GHz only
+  unsigned long now = millis();
+  float dt = g_feed_t ? (float)(now - g_feed_t) : 0.0f; g_feed_t = now;
+  if (dt > 200.0f) dt = 200.0f;
+  if (g_feed_manual && now - g_feed_touch > 7000) g_feed_manual = false;   // resume drift when idle
+
+  // glide-in: new entries at the top ease the existing rows down
+  if (!g_paused && strncmp(rows[0].mac, g_scan_top_mac, 17) != 0) {
+    int shift = 0;
+    for (int i = 0; i < n; ++i) { if (strncmp(rows[i].mac, g_scan_top_mac, 17) == 0) break; shift++; }
+    if (g_scan_top_mac[0] && shift > 0 && shift < n) {
+      g_feed_glide += shift * ROW;
+      if (g_feed_glide > 3 * ROW) g_feed_glide = 3 * ROW;
+    }
+    strncpy(g_scan_top_mac, rows[0].mac, 17); g_scan_top_mac[17] = '\0';
+  }
+  g_feed_glide = (g_feed_glide > 0.5f) ? g_feed_glide * expf(-dt / 70.0f) : 0.0f;
+
+  float total = (float)n * ROW;
+  float maxScroll = total - win; if (maxScroll < 0) maxScroll = 0;
+
+  if (g_feed_manual) {                              // cursor mode: ease to keep sel visible
+    if (g_scan_sel < 0) g_scan_sel = 0; if (g_scan_sel >= n) g_scan_sel = n - 1;
+    float tgt = g_feed_scroll;
+    if (g_scan_sel * ROW < tgt)               tgt = (float)(g_scan_sel * ROW);
+    if ((g_scan_sel + 1) * ROW > tgt + win)   tgt = (float)((g_scan_sel + 1) * ROW - win);
+    if (tgt < 0) tgt = 0; if (tgt > maxScroll) tgt = maxScroll;
+    g_feed_scroll += (tgt - g_feed_scroll) * (1.0f - expf(-dt / 80.0f));
+  } else if (!g_paused && maxScroll > 0.5f) {       // slow ping-pong drift
+    g_feed_scroll += g_feed_dir * (DRIFT_PXPS * dt / 1000.0f);
+    if (g_feed_scroll >= maxScroll) { g_feed_scroll = maxScroll; g_feed_dir = -1; }
+    if (g_feed_scroll <= 0)         { g_feed_scroll = 0;         g_feed_dir =  1; }
+    g_scan_sel = (int)((g_feed_scroll + ROW * 0.5f) / ROW);   // drill targets the top-visible row
+    if (g_scan_sel < 0) g_scan_sel = 0; if (g_scan_sel >= n) g_scan_sel = n - 1;
+  } else if (g_feed_scroll > maxScroll) {
+    g_feed_scroll = maxScroll;
+  }
+
+  int sBase = (int)(g_feed_scroll + 0.5f) + (int)(g_feed_glide + 0.5f);
+
+  cv.setClipRect(0, top, W, win);
+  for (int i = 0; i < n; ++i) {
+    int y = top + i * ROW - sBase;
+    if (y + ROW - 4 <= top || y >= top + win) continue;
+    int cy = y + (ROW - 4) / 2;
+    const RfRow& c = rows[i];
+    bool isTrk = (c.tracker != drone::TRK_NONE);
+    bool sel   = (g_feed_manual && i == g_scan_sel);
+    uint16_t rbg = sel ? LILAC : (isTrk ? TRK_BG : CARD);
+    uint16_t fg  = sel ? HEAD_FG : (isTrk ? TRK_FG : FG);
+    cv.fillSmoothRoundRect(4, y, 232, ROW - 4, 8, rbg);
+    int nameX;
+    if (isTrk) { cv.fillSmoothCircle(16, cy, 4, sel ? HEAD_FG : TRK_DOT); nameX = 30; }
+    else       { drawTypeBadge(12, cy, c.src, sel); nameX = 52; }
+    char rs[8]; snprintf(rs, sizeof(rs), "%d", c.rssi);
+    fontSmall(); cv.setTextDatum(middle_right);
+    cv.setTextColor(sel ? HEAD_FG : MUTE, rbg); cv.drawString(rs, 226, cy);
+    int nameW = (226 - cv.textWidth(rs) - 8) - nameX;
+    cv.setClipRect(nameX, top, nameW > 0 ? nameW : 0, win);
+    fontBody(); cv.setTextDatum(middle_left);
+    cv.setTextColor(fg, rbg); cv.drawString(c.id, nameX, cy);
+    cv.setClipRect(0, top, W, win);
+  }
+  cv.clearClipRect();
+}
+
+static void drawScanScreen() {
+  cv.fillRect(0, 0, W, H, BG);
+
+  RfRow sr[40]; int nc = 0;
+  if (g_paused) { nc = g_dispN; for (int i = 0; i < nc; ++i) sr[i] = g_disp[i]; }
+  else {
+    RfRow rows[40]; int rn = 0;
+    auto addWifi = [&](const char* ssid, const char* bssid, int8_t rssi, uint8_t src) {
+      if (rn >= 40) return;
+      if (ssid && ssid[0]) {
+        for (int j = 0; j < rn; ++j)
+          if (rows[j].src != drone::SRC_BLE && strncmp(rows[j].id, ssid, sizeof(rows[j].id)-1) == 0) {
+            if (rssi > rows[j].rssi) { rows[j].rssi = rssi; rows[j].src = src; } return; }
+      } else {
+        for (int j = 0; j < rn; ++j)
+          if (rows[j].src != drone::SRC_BLE && strncmp(rows[j].mac, bssid, 17) == 0) return;
+      }
+      RfRow& c = rows[rn++]; c.src = src; c.tracker = drone::TRK_NONE;
+      strncpy(c.id, (ssid && ssid[0]) ? ssid : "(hidden)", sizeof(c.id)-1); c.id[sizeof(c.id)-1]='\0';
+      strncpy(c.mac, bssid, sizeof(c.mac)-1); c.mac[sizeof(c.mac)-1]='\0';
+      c.rssi = rssi;
+    };
+    char home_ssid[33]; home_ssid[0] = '\0';
+    if (g_hide_home && WiFi.status() == WL_CONNECTED) {
+      strncpy(home_ssid, WiFi.SSID().c_str(), sizeof(home_ssid)-1); home_ssid[sizeof(home_ssid)-1]='\0'; }
     for (int i = 0; i < g_ap_count; ++i) {
       if (!keepRow(drone::SRC_WIFI_2G, g_aps[i].rssi, g_aps[i].ssid, home_ssid)) continue;
       addWifi(g_aps[i].ssid, g_aps[i].bssid, g_aps[i].rssi, drone::SRC_WIFI_2G);
     }
-
-    // BLE devices (added directly — skipped by addWifi's src != SRC_BLE guard)
     drone::BleSight bs[24]; size_t nb = drone::bleSnapshot(bs, 24);
-    for (size_t i = 0; i < nb && nc < 40; ++i) {
+    for (size_t i = 0; i < nb && rn < 40; ++i) {
       const char* label = bs[i].name[0] ? bs[i].name : bleVendor(bs[i].company_id, bs[i].has_mfr);
-      const char* id    = label ? label : bs[i].mac;
+      const char* id = label ? label : bs[i].mac;
       if (!keepRow(drone::SRC_BLE, bs[i].rssi, id, home_ssid)) continue;
-      RfRow& c = rows[nc++]; c.src = drone::SRC_BLE;
-      strncpy(c.id, id, sizeof(c.id) - 1); c.id[sizeof(c.id)-1] = '\0';
-      strncpy(c.mac, bs[i].mac, sizeof(c.mac) - 1); c.mac[sizeof(c.mac)-1] = '\0';
+      RfRow& c = rows[rn++]; c.src = drone::SRC_BLE; c.tracker = bs[i].tracker;
+      strncpy(c.id, id, sizeof(c.id)-1); c.id[sizeof(c.id)-1]='\0';
+      strncpy(c.mac, bs[i].mac, sizeof(c.mac)-1); c.mac[sizeof(c.mac)-1]='\0';
       c.rssi = bs[i].rssi;
     }
-
-    // C5-reported WiFi (5 GHz + any 2.4 the native scan missed)
     c5link::WifiSight ws[24]; size_t nw = c5link::wifiSnapshot(ws, 24);
     for (size_t i = 0; i < nw; ++i) {
       uint8_t src = (ws[i].band == 5) ? drone::SRC_WIFI_5G : drone::SRC_WIFI_2G;
       if (!keepRow(src, ws[i].rssi, ws[i].ssid, home_ssid)) continue;
       addWifi(ws[i].ssid, ws[i].bssid, ws[i].rssi, src);
     }
+    unsigned long fs[40]; for (int i = 0; i < rn; ++i) { bool nw2; fs[i] = rfFirstSeen(rows[i].mac, &nw2); }
+    int order[40]; for (int i = 0; i < rn; ++i) order[i] = i;
+    for (int i = 1; i < rn; ++i) { int k = order[i], j = i - 1;
+      while (j >= 0 && fs[order[j]] < fs[k]) { order[j+1] = order[j]; --j; } order[j+1] = k; }
+    nc = rn; for (int i = 0; i < nc; ++i) sr[i] = rows[order[i]];
+    for (int i = 0; i < nc; ++i) g_disp[i] = sr[i]; g_dispN = nc;
   }
 
-  // sort: newest first-seen arrival at the top
-  unsigned long fs[40];
-  for (int i = 0; i < nc; ++i) { bool nw2; fs[i] = rfFirstSeen(rows[i].mac, &nw2); }
-  int order[40]; for (int i = 0; i < nc; ++i) order[i] = i;
-  for (int i = 1; i < nc; ++i) { int k = order[i]; int j = i - 1;
-    while (j >= 0 && fs[order[j]] < fs[k]) { order[j+1] = order[j]; --j; } order[j+1] = k; }
-
-  if (!g_paused) { for (int i = 0; i < nc; ++i) g_disp[i] = rows[order[i]]; g_dispN = nc; }
-
-  // ---- no header: rows fill from the top, footer at the bottom ----
-  const int RTOP = 4, FOOT = H - 16, RWIN = FOOT - RTOP - 2;
-
-  if (nc == 0) {
-    fontSmall(); cv.setTextDatum(middle_center); cv.setTextColor(MUTE, BG);
-    cv.drawString(g_wifi_scanning ? "scanning..." : "watching wifi + ble...", W / 2, H / 2);
-  } else {
-    if (!g_paused && strncmp(rows[order[0]].mac, g_scan_top_mac, 17) != 0) {
-      strncpy(g_scan_top_mac, rows[order[0]].mac, 17); g_scan_top_mac[17] = '\0';
-      if (g_scan_view == 0 && g_scan_anim <= 0.0f) { g_scan_anim = (float)F_ROW_H; g_scan_anim_t = millis(); }
-    }
-    if (g_scan_anim > 0.0f) {
-      unsigned long now2 = millis(); float dt = (float)(now2 - g_scan_anim_t); g_scan_anim_t = now2;
-      g_scan_anim *= expf(-dt / 180.0f); if (g_scan_anim < 0.5f) g_scan_anim = 0.0f;
-    }
-    int off = (g_scan_view == 0) ? (int)(g_scan_anim + 0.5f) : 0;
-
-    if (g_scan_sel >= nc) g_scan_sel = nc - 1;
-    if (g_scan_sel < 0)   g_scan_sel = 0;
-    const int kVis = 3;
-    if (g_scan_sel < g_scan_view)         g_scan_view = g_scan_sel;
-    if (g_scan_sel >= g_scan_view + kVis) g_scan_view = g_scan_sel - kVis + 1;
-
-    cv.setClipRect(0, RTOP, W, RWIN);
-    for (int vis = 0; vis <= kVis && (g_scan_view + vis) < nc; ++vis) {
-      int idx = g_scan_view + vis;
-      const RfRow& c = rows[order[idx]];
-      int y  = RTOP + vis * F_ROW_H - off;
-      int cy = y + (F_ROW_H - 4) / 2;
-      bool sel = (idx == g_scan_sel);
-      uint16_t rbg = sel ? LILAC : CARD, fg = sel ? HEAD_FG : FG;
-      cv.fillSmoothRoundRect(4, y, 232, F_ROW_H - 4, 8, rbg);
-      drawTypeBadge(12, cy, c.src, sel);
-      char rs[8]; snprintf(rs, sizeof(rs), "%d", c.rssi);
-      fontSmall(); cv.setTextDatum(middle_right);
-      cv.setTextColor(sel ? HEAD_FG : MUTE, rbg); cv.drawString(rs, 226, cy);
-      int nameW = (226 - cv.textWidth(rs) - 8) - 52;
-      cv.setClipRect(52, RTOP, nameW > 0 ? nameW : 0, RWIN);
-      fontBody(); cv.setTextDatum(middle_left);
-      cv.setTextColor(fg, rbg); cv.drawString(c.id, 52, cy);
-      cv.setClipRect(0, RTOP, W, RWIN);
-    }
-    cv.clearClipRect();
-  }
-
-  // ---- footer: device count (left) + filter (right) ----
-  cv.drawFastHLine(6, FOOT, W - 12, LINE);
-  fontSmall();
-  int lx = 10;
-  if (g_paused) {
-    cv.fillRect(lx, FOOT + 5, 3, 8, LILAC); cv.fillRect(lx + 5, FOOT + 5, 3, 8, LILAC); lx += 14;
-  }
-  char cstr[16]; snprintf(cstr, sizeof(cstr), "%d devices", nc);
-  cv.setTextDatum(middle_left); cv.setTextColor(g_paused ? LILAC : MUTE, BG);
-  cv.drawString(cstr, lx, FOOT + 8);
-
-  const char* fn = (g_filter == RF_ALL) ? "all" : filterName(g_filter);
-  uint16_t fcol; switch (g_filter) {
-    case RF_BLE:  fcol = BB_FG; break; case RF_24: fcol = B2_FG; break;
-    case RF_5:    fcol = B5_FG; break; case RF_NEAR: fcol = VERD; break; default: fcol = FG; }
-  int pw = cv.textWidth(fn) + 14, px = W - 8 - pw;
-  cv.fillSmoothRoundRect(px, FOOT + 2, pw, 13, 6, PILL_BG);
-  cv.setTextDatum(middle_center); cv.setTextColor(fcol, PILL_BG);
-  cv.setClipRect(px, FOOT + 2, pw, 13);
-  cv.drawString(fn, px + pw / 2, FOOT + 8);
-  cv.clearClipRect();
+  char cstr[16]; snprintf(cstr, sizeof(cstr), g_paused ? "%d paused" : "%d devices", nc);
+  drawPillHeader("RF Scan", !g_paused, cstr);
+  drawFeedList(sr, nc, 25, H - 25);
 }
 
 // ---------------------------------------------------------------------------
@@ -1106,15 +1091,26 @@ static void drawDetailScreen() {
   fontBody(); cv.setTextDatum(top_left); cv.setTextColor(F_TEXT, F_BG);
   cv.drawString(r.id[0] ? r.id : "(unknown)", 40, 28);
 
-  int8_t rssi; bool live = liveRssi(r.mac, r.src, &rssi); if (!live) rssi = r.rssi;
-  float frac = (rssi + 90) / 50.0f; if (frac < 0) frac = 0; if (frac > 1) frac = 1;
-  uint16_t sc = (rssi >= -55) ? COL_OK : (rssi >= -70) ? COL_HEAD : COL_BAD;
+  int8_t rssi; bool live = liveRssi(r.mac, r.src, &rssi);
+  // EMA-smooth the signal so 10 Hz refresh reads as a steady trend, not raw jitter.
+  // Resets when you switch contacts; holds (no snap) during brief dropouts.
+  static char  ema_mac[18] = "";
+  static float ema = -90.0f;
+  if (strncmp(ema_mac, r.mac, 17) != 0) {
+    strncpy(ema_mac, r.mac, sizeof(ema_mac) - 1); ema_mac[sizeof(ema_mac) - 1] = '\0';
+    ema = live ? (float)rssi : (float)r.rssi;       // seed on contact switch
+  } else if (live) {
+    ema += 0.25f * ((float)rssi - ema);             // ~0.4 s time constant @ 100 ms
+  }
+  int rint = (int)lroundf(ema);
+  float frac = (ema + 90.0f) / 50.0f; if (frac < 0) frac = 0; if (frac > 1) frac = 1;
+  uint16_t sc = (rint >= -55) ? COL_OK : (rint >= -70) ? COL_HEAD : COL_BAD;
   fontSmall(); cv.setTextDatum(top_left); cv.setTextColor(F_DIM, F_BG);
   cv.drawString(live ? "signal" : "signal (last seen)", 8, 46);
   int bx = 8, by = 56, bw = 180, bh = 18;
   cv.drawRoundRect(bx, by, bw, bh, 3, F_HAIR);
   if (frac > 0.02f) cv.fillSmoothRoundRect(bx, by, (int)(bw * frac), bh, 3, sc);
-  char rb[8]; snprintf(rb, sizeof(rb), "%d", rssi);
+  char rb[8]; snprintf(rb, sizeof(rb), "%d", rint);
   fontBody(); cv.setTextDatum(middle_right); cv.setTextColor(sc, F_BG);
   cv.drawString(rb, 232, by + bh / 2);
 
@@ -1246,7 +1242,7 @@ void setup() {
   Serial.printf("PSRAM: %u bytes\n", (unsigned)ESP.getPsramSize());
   setCpuFrequencyMhz(160);
   M5.Display.setRotation(1);
-  M5.Display.setBrightness(90);
+  M5.Display.setBrightness(60);
   cv.setColorDepth(16);
   cv.setPsram(true);                         // 64 KB canvas in PSRAM -> frees internal RAM for WiFi/BLE/TLS
   if (!cv.createSprite(W, H)) {
@@ -1260,18 +1256,39 @@ void setup() {
     }
   }
 
-  cv.fillScreen(COL_BG);
-  cv.setTextDatum(middle_center);
-  cv.setTextColor(COL_TEXT, COL_BG); fontSmall();
-  cv.drawString("Aware", W / 2, H / 2 - 6);
-  cv.drawString("starting...", W / 2, H / 2 + 8);
-  cv.pushSprite(0, 0);
-  g_popup_until = millis() + 1200;
+  {
+    esp_reset_reason_t rr = esp_reset_reason();
+    const char* rn;
+    switch (rr) {
+      case ESP_RST_POWERON:   rn = "POWERON";   break;
+      case ESP_RST_EXT:       rn = "EXT";       break;
+      case ESP_RST_SW:        rn = "SW";        break;
+      case ESP_RST_PANIC:     rn = "PANIC";     break;
+      case ESP_RST_INT_WDT:   rn = "INT_WDT";   break;
+      case ESP_RST_TASK_WDT:  rn = "TASK_WDT";  break;
+      case ESP_RST_WDT:       rn = "WDT";       break;
+      case ESP_RST_DEEPSLEEP: rn = "DEEPSLEEP"; break;
+      case ESP_RST_BROWNOUT:  rn = "BROWNOUT";  break;
+      default:                rn = "OTHER";     break;
+    }
+    Serial.printf("[boot] reset_reason=%d (%s)\n", (int)rr, rn);
+    bool clean = (rr == ESP_RST_POWERON || rr == ESP_RST_SW);
+    cv.fillScreen(COL_BG);
+    cv.setTextDatum(middle_center);
+    fontSmall(); cv.setTextColor(COL_TEXT, COL_BG);
+    cv.drawString("Aware", W / 2, H / 2 - 16);
+    fontBody(); cv.setTextColor(clean ? COL_TEXT : COL_BAD, COL_BG);
+    cv.drawString(rn, W / 2, H / 2 + 8);
+    cv.pushSprite(0, 0);
+    delay(clean ? 600 : 2000);   // linger on a crash/brownout reason so it's readable
+  }
+  g_popup_until = millis() + 600;
 
   loadCfg();
   WiFi.mode(WIFI_STA);
   WiFi.begin(g_cfg.ssid.c_str(), g_cfg.pass.c_str());
   WiFi.setSleep(true);
+  esp_wifi_set_max_tx_power(34);   // ~8.5 dBm: trims the TX current spike that trips brownout
   services::adsb::begin();
   services::adsb::setCenter(g_cfg.lat, g_cfg.lon, rangeKm() * 1.3f);
 
@@ -1308,39 +1325,15 @@ void loop() {
   // BtnA long-press: toggle pause / unpause the feed (SCAN or BLE)
   if (M5.BtnA.wasHold() && (g_screen == SCR_SCAN || g_screen == SCR_BLE || g_screen == SCR_AIRSPACE)) {
     g_paused = !g_paused;
-    if (g_paused) g_scan_sel = 0;
-    else          g_detail   = false;
+    if (!g_paused) g_detail = false;   // freezing keeps your current cursor row
     render();
   }
 
   // BtnB click: live = change filter; paused = scroll; in item = next contact
   if (M5.BtnB.wasClicked()) {
-    if (g_screen == SCR_SCAN) {
-      if (g_detail) {
-        if (g_dispN > 0) { g_scan_sel = (g_scan_sel + 1) % g_dispN; g_detail_row = g_disp[g_scan_sel]; }
-      } else if (!g_paused) {
-        g_filter = (g_filter + 1) % RF_COUNT;
-      } else {
-        g_scan_sel = g_scan_sel + 1;
-      }
-    } else if (g_screen == SCR_BLE) {
-      if (g_detail) {
-        if (g_bleFrozenN > 0) {
-          g_scan_sel = (g_scan_sel + 1) % g_bleFrozenN;
-          const drone::BleSight& bs = g_bleFrozen[g_scan_sel];
-          g_detail_row.src = drone::SRC_BLE; g_detail_row.rssi = bs.rssi;
-          g_detail_row.tracker = bs.tracker;
-          strncpy(g_detail_row.mac, bs.mac, sizeof(g_detail_row.mac) - 1);
-          g_detail_row.mac[sizeof(g_detail_row.mac) - 1] = '\0';
-          const char* lbl = bs.name[0] ? bs.name : bs.mac;
-          strncpy(g_detail_row.id, lbl, sizeof(g_detail_row.id) - 1);
-          g_detail_row.id[sizeof(g_detail_row.id) - 1] = '\0';
-        }
-      } else if (!g_paused) {
-        g_bleTrkOnly = !g_bleTrkOnly;
-      } else {
-        g_scan_sel++;
-      }
+    if (g_screen == SCR_SCAN || g_screen == SCR_BLE) {
+      g_feed_manual = true; g_feed_touch = millis();
+      if (g_dispN > 0) { g_scan_sel = (g_scan_sel + 1) % g_dispN; if (g_detail) g_detail_row = g_disp[g_scan_sel]; }
     } else if (g_screen == SCR_AIRSPACE) {
       if (g_air_count > 0) g_airspace_sel = (g_airspace_sel + 1) % g_air_count;
     } else if (g_screen == SCR_SETUP && !g_portal_active) {
@@ -1359,24 +1352,11 @@ void loop() {
         services::adsb::setCenter(g_cfg.lat, g_cfg.lon, rangeKm() * 1.3f);
       }
     } else if (g_screen == SCR_SCAN || g_screen == SCR_BLE) {
-      if (g_detail) {
-        g_detail = false;
-      } else if (g_paused) {
-        if (g_screen == SCR_BLE && g_bleFrozenN > 0) {
-          int s = g_scan_sel; if (s < 0) s = 0; if (s >= g_bleFrozenN) s = g_bleFrozenN - 1;
-          const drone::BleSight& bs = g_bleFrozen[s];
-          g_detail_row.src = drone::SRC_BLE; g_detail_row.rssi = bs.rssi;
-          g_detail_row.tracker = bs.tracker;
-          strncpy(g_detail_row.mac, bs.mac, sizeof(g_detail_row.mac) - 1);
-          g_detail_row.mac[sizeof(g_detail_row.mac) - 1] = '\0';
-          const char* lbl = bs.name[0] ? bs.name : bs.mac;
-          strncpy(g_detail_row.id, lbl, sizeof(g_detail_row.id) - 1);
-          g_detail_row.id[sizeof(g_detail_row.id) - 1] = '\0';
-          g_detail = true;
-        } else if (g_screen == SCR_SCAN && g_dispN > 0) {
-          int s = g_scan_sel; if (s < 0) s = 0; if (s >= g_dispN) s = g_dispN - 1;
-          g_detail_row = g_disp[s]; g_detail = true;
-        }
+      g_feed_manual = true; g_feed_touch = millis();
+      if (g_detail) { g_detail = false; }
+      else if (g_dispN > 0) {
+        int s = g_scan_sel; if (s < 0) s = 0; if (s >= g_dispN) s = g_dispN - 1;
+        g_detail_row = g_disp[s]; g_detail = true;
       }
     }
     render();
@@ -1429,20 +1409,20 @@ void loop() {
     int  mv    = M5.Power.getBatteryVoltage();
     bool onUsb = M5.Power.isCharging();
     g_mv_cache = mv; g_usb_cache = onUsb;
-    if (onUsb || mv <= 0) {
+    if (onUsb || mv < 2600) {     // on USB, or no/garbled cell read -> never "low"
       low_reads = 0;
     } else if (mv < 3100) {
-      if (++low_reads >= 3) {                // ~15 s sustained before sleeping
+      if (++low_reads >= 3) {                // ~15 s sustained low (and NOT on USB)
         cv.fillScreen(COL_BG);
         cv.setTextColor(COL_BAD, COL_BG);
         cv.setTextDatum(middle_center);
         cv.drawString("LOW BATTERY", W / 2, H / 2);
         cv.pushSprite(0, 0);
         delay(1500);
-        // TODO: configure a button wake source before sleeping so the unit can
-        // be revived without a power cycle. Verify the StickS3 BtnA/PWR GPIO
-        // from M5Unified / M5 docs first — do NOT guess the pin.
-        esp_deep_sleep_start();
+        low_reads = 0;                       // warn only -- do NOT deep-sleep
+        // esp_deep_sleep_start() removed: no wake source is configured, so with USB
+        // attached it can re-wake immediately (reset loop) and on battery it bricks
+        // until a power-cycle. Re-enable only after a BtnA/PWR wake GPIO is set up.
       }
     } else {
       low_reads = 0;
@@ -1487,10 +1467,9 @@ void loop() {
     last_recon = now; WiFi.reconnect();
   }
 
-  // drive the feed slide-in at ~30 fps while it's animating (the 1 Hz idle render is too slow)
-  static unsigned long last_anim = 0;
-  if (g_screen == SCR_SCAN && g_scan_anim > 0.0f && now - last_anim > 16) {
-    last_anim = now; render();
+  static unsigned long last_feed = 0;
+  if ((g_screen == SCR_SCAN || g_screen == SCR_BLE) && !g_detail && now - last_feed > 33) {
+    last_feed = now; render();
   }
   static unsigned long last_air = 0;
   if (g_screen == SCR_AIRSPACE && !g_air_detail && now - last_air > 33) { last_air = now; render(); }
@@ -1501,7 +1480,7 @@ void loop() {
   if (now - last_idle > 1000) { last_idle = now; render(); }
 
   static unsigned long last_detail = 0;
-  if (g_detail && now - last_detail > 300) { last_detail = now; render(); }
+  if (g_detail && now - last_detail > 100) { last_detail = now; render(); }   // 10 Hz finder
 
   {
     static unsigned long s_bri_t = 0;
