@@ -30,6 +30,10 @@
 #include "fonts/pjs_small.h"
 #include "fonts/pjs_body.h"
 #include "fonts/pjs_num.h"
+#include "audio/aware_boot.h"
+#include "audio/aircraft_wav.h"
+#include "audio/drone_wav.h"
+#include "audio/tracker_wav.h"
 
 // ---- palette ---------------------------------------------------------------
 static constexpr uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
@@ -85,6 +89,7 @@ static inline void fontNum  () { cv.loadFont(pjs_num);   cv.setTextSize( 1 ); } 
 enum Screen { SCR_AIRSPACE = 0, SCR_CONN, SCR_SCAN, SCR_BLE, SCR_STATS, SCR_SETUP, SCR_COUNT };
 static int           g_screen      = SCR_AIRSPACE;
 static unsigned long g_popup_until = 0;
+static unsigned long g_screen_since = 0;   // ms when current screen was entered (glyph entrance)
 
 static const char* screenName(int s) {
   switch (s) {
@@ -114,7 +119,38 @@ static float         g_feed_vel_eased = TICKER_PXPS; // smoothed velocity actual
 static float         g_tilt_neutral = 99.0f;       // adaptive resting pitch (99 = uninitialised)
 static bool          g_tilt_scrub  = false;        // past the deadzone right now
 static int           g_tilt_dir    = 0;            // -1 up, +1 down (for the chevron)
+static float         g_tilt_e      = 0.0f;         // live tilt deviation from neutral (for the HUD)
 static bool          g_detail    = false;
+
+// ---- cursor mode (feed screens) ----
+static bool          g_cursor_mode   = false;      // selection cursor active on feed screen
+static char          g_cursor_mac[18] = {};         // pinned entry MAC — survives feed reorder
+static unsigned long g_cursor_idle_ms = 0;          // time of last cursor gesture (8 s timeout)
+static bool          g_pitch_armed   = true;        // must re-centre before next discrete step
+static float         g_cursor_anim_y = 0.0f;        // animated highlight Y (pixels in list coords)
+
+// ---------------------------------------------------------------------------
+// Locator mode — BLE proximity beep (faster = closer)
+// ---------------------------------------------------------------------------
+static bool          g_locating            = false;
+static char          g_locate_mac[18]      = {};   // target BLE MAC
+static char          g_locate_id[24]       = {};   // target display label
+static float         g_rssi_smooth         = -100.0f;
+static unsigned long g_locate_last_seen_ms = 0;
+static unsigned long g_locate_last_beep_ms = 0;
+// Tunables — all named, no magic numbers
+static constexpr float         kLocFar          = -90.0f;  // dBm far end → slow beep
+static constexpr float         kLocNear         = -45.0f;  // dBm near end → solid tone
+static constexpr int           kLocSlowMs       = 1200;    // ms between beeps at far
+static constexpr int           kLocFastMs       =   60;    // ms between beeps at near
+static constexpr float         kLocAlpha        =  0.30f;  // EMA smoothing factor
+static constexpr unsigned long kLocLostMs       = 2500;    // ms without sighting = signal lost
+static constexpr uint16_t      kLocFreq         = 2700;    // Hz — cutting but not shrill
+static constexpr int           kLocDurMs        =   35;    // ms per locator beep
+static constexpr uint16_t      kLocSearchFreq   =  500;    // Hz — "searching" low tone
+static constexpr int           kLocSearchDurMs  =  500;    // ms for searching beep
+static constexpr unsigned long kLocSearchPeriod = 2000;    // ms between searching beeps
+
 static int           g_airspace_sel = 0;
 static bool          g_air_detail   = false;
 static unsigned long g_last_motion = 0;
@@ -140,7 +176,9 @@ static void gotoScreen(int s) {
     g_scan_sel = 0;   g_scan_view = 0;
     g_feed_scroll = 0; g_feed_manual = false; g_dispN = 0;
     g_air_detail = false; g_airspace_sel = 0;
+    g_cursor_mode = false; g_cursor_mac[0] = '\0'; g_cursor_anim_y = 0.0f;
     g_popup_until = millis() + 1200;
+    g_screen_since = millis();
   }
 }
 
@@ -543,24 +581,86 @@ static void buildAirContacts() {
   if (g_airspace_sel < 0)  g_airspace_sel = 0;
 }
 
+// ---------------------------------------------------------------------------
+// VoiceAnnouncer — screen-gated, new-contact-only, cooldown-capped playback.
+// No heap: fixed C-string seen table. Global isPlaying() guard prevents overlap.
+// kIdLen = 21 covers drone Remote ID serials (20 chars) and MACs (17 chars).
+// ---------------------------------------------------------------------------
+struct VoiceAnnouncer {
+  static constexpr int kMaxSeen = 32;
+  static constexpr int kIdLen   = 21;
+
+  const uint8_t* clip       = nullptr;
+  size_t         clip_len   = 0;
+  unsigned long  cooldown_ms = 9000;
+  char           seen[kMaxSeen][kIdLen] = {};
+  int            seen_n     = 0;
+  unsigned long  last_ms    = 0;
+
+  void init(const uint8_t* c, size_t len, unsigned long cd) {
+    clip = c; clip_len = len; cooldown_ms = cd;
+  }
+
+  // ids[0..n-1] = current live contact IDs for this source.
+  // screen_active = the owning screen is currently displayed.
+  void check(const char* const* ids, int n, bool screen_active) {
+    // Prune seen entries that are no longer in the live set
+    int w = 0;
+    for (int i = 0; i < seen_n; ++i) {
+      bool alive = false;
+      for (int j = 0; j < n && !alive; ++j)
+        if (ids[j] && strncmp(seen[i], ids[j], kIdLen - 1) == 0) alive = true;
+      if (alive) { if (w != i) memcpy(seen[w], seen[i], kIdLen); ++w; }
+    }
+    seen_n = w;
+
+    // Detect new IDs and add to seen
+    bool new_found = false;
+    for (int j = 0; j < n; ++j) {
+      if (!ids[j] || !ids[j][0]) continue;
+      bool known = false;
+      for (int i = 0; i < seen_n && !known; ++i)
+        if (strncmp(seen[i], ids[j], kIdLen - 1) == 0) known = true;
+      if (!known) {
+        new_found = true;
+        if (seen_n < kMaxSeen) {
+          strncpy(seen[seen_n], ids[j], kIdLen - 1);
+          seen[seen_n][kIdLen - 1] = '\0';
+          ++seen_n;
+        }
+      }
+    }
+
+    if (!new_found || !screen_active) return;
+    unsigned long now = millis();
+    if (now - last_ms >= cooldown_ms && !M5.Speaker.isPlaying()) {
+      last_ms = now;
+      M5.Speaker.playWav(clip, clip_len);
+    }
+  }
+};
+
+static VoiceAnnouncer g_aircraft_va;   // callsign/hex, gated on SCR_AIRSPACE, 9 s cooldown
+static VoiceAnnouncer g_drone_va;      // RID serial or MAC, gated on SCR_AIRSPACE, 9 s cooldown
+static VoiceAnnouncer g_tracker_va;    // tracker MAC (following only), gated on SCR_BLE, 60 s cooldown
+
+// Tracker "following" thresholds — announce only for close, persistent trackers.
+// MAC rotation: AirTags rotate ~every 24 h when separated (vs 15 min when paired),
+// so a 10-min first_seen window catches separated tags without firing on paired ones.
+static constexpr int8_t  kFollowRssiMin    = -75;               // dBm — must be nearby
+static constexpr unsigned long kFollowPersistMs = 10UL * 60 * 1000; // 10 min continuous presence
+
 static void drawAirspaceScreen() {
   cv.fillScreen(BG);
   buildAirContacts();
   int n = g_air_count;
   if (g_airspace_sel >= n) g_airspace_sel = (n > 0) ? n - 1 : 0;
 
-  // ---- header: AIRSPACE pill + lilac "N contacts" ----
-  drawPillHeader("Airspace", true, "", true);
-  { char cc[14]; snprintf(cc, sizeof(cc), "%d contacts", n);
-    fontSmall(); int rw = cv.textWidth(cc) + 16, rx = W - 6 - rw;
-    cv.fillSmoothRoundRect(rx, 5, rw, 18, 9, LILAC);
-    cv.setTextColor(HEAD_FG, LILAC); cv.setTextDatum(middle_center);
-    cv.setClipRect(rx, 5, rw, 18); cv.drawString(cc, rx + rw / 2, 14); cv.clearClipRect(); }
-  if (g_paused) { fontSmall(); int tr = 6 + cv.textWidth("Airspace") + 16;
-    cv.fillRect(tr + 8, 8, 3, 10, LILAC); cv.fillRect(tr + 13, 8, 3, 10, LILAC); }
+  // headerless — plane glyph (top-left) + entry toast carry identity
+  if (g_paused) { cv.fillRect(6, 6, 3, 11, LILAC); cv.fillRect(11, 6, 3, 11, LILAC); }
 
   // ================= RADAR =================
-  const int cx = 64, cy = 82, R = 46;
+  const int cx = 64, cy = 74, R = 48;
   const uint16_t RADAR_BG = rgb565(0x2C,0x26,0x4C), RING = rgb565(0x55,0x4C,0x80);
   auto lerp565 = [](uint16_t a, uint16_t b, float t) -> uint16_t {
     if (t < 0) t = 0; if (t > 1) t = 1;
@@ -596,7 +696,7 @@ static void drawAirspaceScreen() {
   // ================= end radar =================
 
   // ---- right: scrollable contact list ----
-  const int LX = 114, LR = 236, top = 30, rowH = 22, kVis = 4;
+  const int LX = 114, LR = 236, top = 8, rowH = 22, kVis = 5;
   const uint16_t AMBER = rgb565(0xE3,0xA9,0x4C), HILITE = rgb565(0x26,0x22,0x3A);
   if (n == 0) {
     fontSmall(); cv.setTextDatum(middle_center); cv.setTextColor(MUTE, BG);
@@ -690,7 +790,7 @@ static void drawStubScreen(const char* title, const char* note) {
 // ---------------------------------------------------------------------------
 static void drawStatsScreen() {
   cv.fillRect(0, 0, W, H, BG);
-  drawPillHeader("Stats", false, "");        // bare title pill (battery is its own tile)
+  // headerless — gauge glyph + entry toast
 
   // ---- readings ----
   float c   = temperatureRead();
@@ -710,36 +810,34 @@ static void drawStatsScreen() {
   const uint16_t T_PURPLE = rgb565(0x6E,0x4C,0x82);   // nudged red-ward so the panel reads purple, not blue
   const uint16_t T_TEAL   = rgb565(0x2D,0x6E,0x7C);
   const uint16_t T_BROWN  = rgb565(0x7A,0x57,0x33);
-  const uint16_t U_FG = rgb565(0xCE,0xD2,0xDC);        // unit
-  const uint16_t L_FG = rgb565(0xA8,0xAD,0xBC);        // label (muted)
+  // value + label share one colour per tile (set at the call site)
 
   // ---- 2x2 grid: even gutters; number high, unit centered beside it, label on the floor ----
   const int P    = 7;                          // outer margin + middle gutter
-  const int top  = 27;                         // just below the header pill
+  const int top  = 6;                           // headerless
   const int tw   = (W - P * 3) / 2;            // 109
-  const int th   = 48;
+  const int th   = 56;
   const int vgap = 7;
   const int x1 = P, x2 = W - P - tw;
   const int y1 = top, y2 = top + th + vgap;
 
   const int PADX     = 14;                     // text inset from the tile's left edge
-  const int NUM_BASE = 26;                     // number baseline, from tile top  (top gap ~4px)
-  const int LBL_BASE = th - 5;                 // label baseline, from tile top    (bottom gap ~5px)
+  const int VAL_BASE = 22;                     // value baseline from the tile top
+  const int LBL_BASE = th - 8;                 // label baseline from the tile top
 
-  auto tile = [&](int x, int y, uint16_t bg, uint16_t numCol,
+  auto tile = [&](int x, int y, uint16_t bg, uint16_t col,
                   const char* num, const char* unit, const char* label) {
     cv.fillSmoothRoundRect(x, y, tw, th, 13, bg);
-    // hero number — transparent bg + baseline datum lets it sit high with a clean top gap
-    fontNum(); cv.setTextDatum(baseline_left); cv.setTextColor(numCol);
-    cv.drawString(num, x + PADX, y + NUM_BASE);
+    // value + unit, one line at the top, body size
+    fontBody(); cv.setTextDatum(baseline_left); cv.setTextColor(col);
+    cv.drawString(num, x + PADX, y + VAL_BASE);
     int nw = cv.textWidth(num);
-    // unit — small, vertically centered on the number, to its right
     if (unit && unit[0]) {
-      fontSmall(); cv.setTextDatum(middle_left); cv.setTextColor(U_FG);
-      cv.drawString(unit, x + PADX + nw + 6, y + NUM_BASE - 10);
+      fontSmall(); cv.setTextDatum(baseline_left); cv.setTextColor(col);
+      cv.drawString(unit, x + PADX + nw + 4, y + VAL_BASE);
     }
-    // label — muted caps pinned to the bottom
-    fontSmall(); cv.setTextDatum(baseline_left); cv.setTextColor(L_FG);
+    // label — same colour as the value, pinned to the bottom
+    fontSmall(); cv.setTextDatum(baseline_left); cv.setTextColor(col);
     cv.drawString(label, x + PADX, y + LBL_BASE);
   };
 
@@ -755,7 +853,7 @@ static void drawStatsScreen() {
 // ---------------------------------------------------------------------------
 static void drawConnScreen() {
   cv.fillRect(0, 0, W, H, BG);
-  drawTopBar("Connections");
+  // headerless — node glyph + entry toast
 
   // ---- data ----
   bool c5up = c5link::linked();
@@ -771,7 +869,7 @@ static void drawConnScreen() {
   if (s_kbps < 0 || !c5up) s_kbps = 0;
 
   // ---- hero: title (line 1), subtitle + big KB/s (line 2) ----
-  int hx = 6, hy = 27, hw = 228, hh = 44;
+  int hx = 6, hy = 6, hw = 228, hh = 50;
   uint16_t hbg  = c5up ? MINT : CARD;
   uint16_t hsub = c5up ? rgb565(0xC8,0xE6,0xD4) : MUTE;
   drawCard(hx, hy, hw, hh, hbg, false);
@@ -798,7 +896,7 @@ static void drawConnScreen() {
     cv.setTextDatum(middle_left);  cv.setTextColor(FG, CARD);   cv.drawString(label, x + 24, cy);
     cv.setTextDatum(middle_right); cv.setTextColor(MUTE, CARD); cv.drawString(val, x + w - 10, cy);
   };
-  int gh = 27, tw = (hw - 6) / 2;
+  int gh = 31, tw = (hw - 6) / 2;
   int gy1 = hy + hh + 4, gy2 = gy1 + gh + 3;
   int x1 = hx, x2 = hx + tw + 6;
   char v[12];
@@ -936,6 +1034,16 @@ static void feedSortBleStable() {                               // trackers firs
 
 static void drawFeedList(const RfRow* rows, int n, int top, int win);   // defined below
 static bool isMuted(const char* mac);                                   // defined below
+static uint16_t lerp565(uint16_t a, uint16_t b, float t);              // defined below
+
+// Re-resolve g_cursor_mac → g_scan_sel after a feed rebuild. Keeps cursor on the
+// same identity when entries expire or new ones are appended; no-op when cursor off.
+static void cursorResolve() {
+  if (!g_cursor_mode || !g_cursor_mac[0]) return;
+  for (int i = 0; i < g_dispN; ++i)
+    if (strncmp(g_disp[i].mac, g_cursor_mac, 17) == 0) { g_scan_sel = i; return; }
+  if (g_scan_sel >= g_dispN) g_scan_sel = g_dispN > 0 ? g_dispN - 1 : 0;
+}
 
 static void drawBleScreen() {
   cv.fillRect(0, 0, W, H, BG);
@@ -950,7 +1058,7 @@ static void drawBleScreen() {
       feedUpsert(drone::SRC_BLE, b[i].tracker, id, b[i].mac, b[i].rssi);
     }
     feedExpire(5000);
-    feedSortBleStable();
+    if (g_cursor_mode) cursorResolve(); else feedSortBleStable();
     s_bleBuild = millis();
   }
 
@@ -1008,7 +1116,7 @@ static void drawFeedList(const RfRow* rows, int n, int top, int win) {
   unsigned long now = millis();
   float dt = g_feed_t ? (float)(now - g_feed_t) : 0.0f; g_feed_t = now;
   if (dt > 40.0f) dt = 40.0f;                       // a stalled frame can't lurch the scroll far
-  if (g_feed_manual && now - g_feed_touch > 7000) g_feed_manual = false;
+  if (g_feed_manual && !g_cursor_mode && now - g_feed_touch > 7000) g_feed_manual = false;
 
   int kVis = win / ROW; if (kVis < 1) kVis = 1;
   float total = (float)n * ROW;
@@ -1022,7 +1130,7 @@ static void drawFeedList(const RfRow* rows, int n, int top, int win) {
     if (g_scan_sel * ROW < tgt)             tgt = (float)(g_scan_sel * ROW);
     if ((g_scan_sel + 1) * ROW > tgt + win) tgt = (float)((g_scan_sel + 1) * ROW - win);
     if (tgt < 0) tgt = 0; if (tgt > maxS) tgt = maxS;
-    g_feed_scroll += (tgt - g_feed_scroll) * (1.0f - expf(-dt / 80.0f));
+    g_feed_scroll += (tgt - g_feed_scroll) * (1.0f - expf(-dt / 55.0f));
   } else if (ticker) {                              // tilt-controlled flow, seamless wrap both ways
     g_feed_vel_eased += (g_feed_vel - g_feed_vel_eased) * (1.0f - expf(-dt / 110.0f));  // smooth speed
     g_feed_scroll += g_feed_vel_eased * dt / 1000.0f;
@@ -1070,10 +1178,21 @@ static void drawFeedList(const RfRow* rows, int n, int top, int win) {
     }
     if (topIdx >= 0) g_scan_sel = topIdx;            // drill target = the row currently at the top
   } else {
+    // animate cursor highlight toward g_scan_sel; snap instantly in non-cursor manual
+    float anim_target = (float)(g_scan_sel * ROW);
+    if (g_cursor_mode) {
+      g_cursor_anim_y += (anim_target - g_cursor_anim_y) * (1.0f - expf(-dt / 55.0f));
+    } else {
+      g_cursor_anim_y = anim_target;
+    }
+    int anim_sel = (int)lroundf(g_cursor_anim_y / ROW);
+    if (anim_sel < 0) anim_sel = 0;
+    if (anim_sel >= n) anim_sel = n - 1;
+
     for (int i = 0; i < n; ++i) {
       int y = top + i * ROW - sInt;
       if (y + ROW <= top || y >= top + win) continue;
-      row(rows[i], y, (g_feed_manual && i == g_scan_sel));
+      row(rows[i], y, (g_feed_manual && i == anim_sel));
     }
   }
   cv.clearClipRect();
@@ -1083,6 +1202,70 @@ static void drawFeedList(const RfRow* rows, int n, int top, int win) {
     int cxp = W / 2;
     if (g_tilt_dir < 0) { int yy = top + 4;       cv.fillTriangle(cxp-7, yy+5, cxp+7, yy+5, cxp, yy, cc); }
     else                { int yy = top + win - 5; cv.fillTriangle(cxp-7, yy-5, cxp+7, yy-5, cxp, yy, cc); }
+  }
+
+  // ===== tilt HUD =====
+  {
+    const float HUD_DEAD = 0.18f, HUD_RANGE = 0.45f;   // HUD_DEAD must match the tick's TILT_DEAD
+    const int   cxp = W / 2, half = 34, ty = H - 5;
+
+    // (A) live hash indicator — fades in while tilting, marker rides toward the hashes
+    static float s_hud = 0.0f;
+    float tgt = (fabsf(g_tilt_e) > 0.05f) ? 1.0f : 0.0f;
+    s_hud += (tgt - s_hud) * 0.20f;
+    if (s_hud > 0.02f) {
+      uint16_t base = lerp565(BG, rgb565(0x6A,0x6A,0x78), s_hud);
+      uint16_t hot  = lerp565(BG, rgb565(0xF4,0xF4,0xF7), s_hud);
+      cv.drawFastHLine(cxp - half, ty, half * 2, base);
+      int dz = (int)(half * (HUD_DEAD / HUD_RANGE));     // deadzone-edge "scroll starts here" hashes
+      cv.drawFastVLine(cxp - dz, ty - 3, 6, base);
+      cv.drawFastVLine(cxp + dz, ty - 3, 6, base);
+      cv.drawFastVLine(cxp,      ty - 2, 4, base);        // center (neutral) tick
+      float pe = g_tilt_e / HUD_RANGE; if (pe > 1) pe = 1; if (pe < -1) pe = -1;
+      int  mx   = cxp + (int)(pe * half);
+      bool past = fabsf(g_tilt_e) > HUD_DEAD;
+      cv.fillSmoothCircle(mx, ty, past ? 3 : 2, past ? hot : base);
+    }
+
+    // (B) entry hint — rocking device + "tilt to scroll", after the name toast
+    unsigned long te = millis() - g_screen_since;
+    float hop = 0.0f;
+    if      (te < 1300) hop = 0.0f;
+    else if (te < 1600) hop = (te - 1300) / 300.0f;
+    else if (te < 2700) hop = 1.0f;
+    else if (te < 3100) hop = 1.0f - (te - 2700) / 400.0f;
+    if (hop > 0.02f) {
+      uint16_t hc = lerp565(BG, rgb565(0xF4,0xF4,0xF7), hop * 0.9f);
+      int hx = W / 2, hy = H - 30;
+      float th = sinf(millis() / 150.0f) * 0.22f;        // rock ±~12 deg
+      float co = cosf(th), si = sinf(th);
+      const float pxs[4] = { -11, 11, 11, -11 };
+      const float pys[4] = {  -6, -6,  6,   6 };
+      int rx[4], ry[4];
+      for (int i = 0; i < 4; ++i) {
+        rx[i] = hx + (int)lroundf(pxs[i] * co - pys[i] * si);
+        ry[i] = hy + (int)lroundf(pxs[i] * si + pys[i] * co);
+      }
+      cv.fillTriangle(rx[0], ry[0], rx[1], ry[1], rx[2], ry[2], hc);
+      cv.fillTriangle(rx[0], ry[0], rx[2], ry[2], rx[3], ry[3], hc);
+      uint16_t slit = lerp565(BG, rgb565(0x1C,0x1C,0x24), hop);
+      cv.drawLine(rx[0] + (rx[3]-rx[0]) / 4, ry[0] + (ry[3]-ry[0]) / 4,
+                  rx[1] + (rx[2]-rx[1]) / 4, ry[1] + (ry[2]-ry[1]) / 4, slit);
+      cv.drawLine(hx - 21, hy - 3, hx - 16, hy, hc); cv.drawLine(hx - 21, hy + 3, hx - 16, hy, hc);
+      cv.drawLine(hx + 21, hy - 3, hx + 16, hy, hc); cv.drawLine(hx + 21, hy + 3, hx + 16, hy, hc);
+      fontSmall(); cv.setTextDatum(middle_center); cv.setTextColor(hc);
+      cv.drawString("tilt to scroll", hx, hy + 17);
+    }
+  }
+
+  // position counter: "4/17" pill in the top-right of the feed window during cursor mode
+  if (g_cursor_mode && n > 0) {
+    char pi[12]; snprintf(pi, sizeof(pi), "%d/%d", g_scan_sel + 1, n);
+    fontSmall();
+    int pw = cv.textWidth(pi) + 12;
+    cv.fillSmoothRoundRect(W - 6 - pw, top + 4, pw, 15, 7, PILL_BG);
+    cv.setTextColor(MUTE, PILL_BG); cv.setTextDatum(middle_center);
+    cv.drawString(pi, W - 6 - pw / 2, top + 12);
   }
 }
 
@@ -1113,7 +1296,7 @@ static void drawScanScreen() {
         feedUpsert(src, drone::TRK_NONE, ws[i].ssid[0] ? ws[i].ssid : "(hidden)", ws[i].bssid, ws[i].rssi);
       } }
     feedExpire(5000);
-    feedSortByFirstSeen();
+    if (g_cursor_mode) cursorResolve(); else feedSortByFirstSeen();
     s_scanBuild = millis();
   }
 
@@ -1186,7 +1369,8 @@ static void muteAdd(const char* mac, unsigned long ms) {
 
 static void drawDetailScreen() {
   const RfRow& r = g_detail_row;
-  bool isTrk = (r.tracker != drone::TRK_NONE);
+  bool isTrk  = (r.tracker != drone::TRK_NONE);
+  bool named  = r.id[0] && strncmp(r.id, r.mac, 17) != 0;   // has a real name (not just its MAC)
 
   const uint16_t ACC    = isTrk ? COL_BAD : LILAC;
   const uint16_t BANNER = isTrk ? rgb565(0x40,0x1E,0x22) : rgb565(0x24,0x21,0x3C);
@@ -1197,85 +1381,84 @@ static void drawDetailScreen() {
 
   cv.fillRect(0, 0, W, H, BG);
 
-  // ---- live RSSI, EMA smoothing, peak, sparkline history, trend ----
+  // ---- live RSSI, EMA, peak, sparkline history (seeded full so it reads as a line immediately) ----
   int8_t rssi; bool live = liveRssi(r.mac, r.src, &rssi);
   static char  st_mac[18] = "";
   static float ema = -90.0f, refEma = -90.0f;
   static int8_t peak = -120, hist[40]; static int histN = 0;
   static unsigned long lastPush = 0, refMs = 0;
-  if (strncmp(st_mac, r.mac, 17) != 0) {
+  if (strncmp(st_mac, r.mac, 17) != 0) {                    // new contact -> reset + seed
     strncpy(st_mac, r.mac, 17); st_mac[17] = '\0';
     ema = live ? (float)rssi : (float)r.rssi;
-    peak = (int8_t)ema; histN = 0; lastPush = 0; refEma = ema; refMs = millis();
+    peak = (int8_t)ema; refEma = ema; refMs = millis(); lastPush = millis();
+    for (int i = 0; i < 40; ++i) hist[i] = (int8_t)ema;     // full flat line at the current level
+    histN = 40;
   } else if (live) {
     ema += 0.25f * ((float)rssi - ema);
   }
   if (live && (int8_t)ema > peak) peak = (int8_t)ema;
-  if (millis() - lastPush > 280) {
+  if (millis() - lastPush > 150) {                          // ~6 s window across 40 samples
     lastPush = millis();
-    if (histN < 40) hist[histN++] = (int8_t)ema;
-    else { memmove(hist, hist + 1, 39); hist[39] = (int8_t)ema; }
+    memmove(hist, hist + 1, 39); hist[39] = (int8_t)ema;
   }
   float trend = ema - refEma;
   if (millis() - refMs > 900) { refEma = ema; refMs = millis(); }
   int rint = (int)lroundf(ema);
 
-  // ---- alert banner ----
+  // ---- banner ----
   const int bx = 5, by = 4, bw = W - 10, bh = 34;
   cv.fillSmoothRoundRect(bx, by, bw, bh, 11, BANNER);
-  float pulse = 0.5f + 0.5f * sinf(millis() * 0.005f);                 // breathing dot
+  float pulse = 0.5f + 0.5f * sinf(millis() * 0.005f);
   uint16_t dotc = live ? lerp565(BANNER, ACC, 0.12f + 0.88f * pulse) : lerp565(BANNER, ACC, 0.35f);
   cv.fillSmoothCircle(bx + 15, by + bh / 2, 4, dotc);
+  int nameClip = isTrk ? 148 : (bw - 27 - 12);             // full width when there's no status word
   fontBody(); cv.setTextDatum(top_left); cv.setTextColor(NAMEC, BANNER);
-  cv.setClipRect(bx + 27, by, 150, bh);
+  cv.setClipRect(bx + 27, by, nameClip, bh);
   cv.drawString(r.id[0] ? r.id : "(unknown)", bx + 27, by + 4);
   cv.clearClipRect();
   fontSmall(); cv.setTextDatum(top_left); cv.setTextColor(SUBC, BANNER);
   cv.drawString(isTrk ? trackerNetwork(r.tracker) : srcName(r.src), bx + 27, by + 20);
-  fontBody(); cv.setTextDatum(middle_right); cv.setTextColor(ACC, BANNER);
-  cv.drawString(isTrk ? "TRACKING" : "SIGNAL", bx + bw - 12, by + bh / 2);
+  if (isTrk) {                                             // status word only for trackers (no "SIGNAL")
+    fontBody(); cv.setTextDatum(middle_right); cv.setTextColor(ACC, BANNER);
+    cv.drawString("TRACKING", bx + bw - 12, by + bh / 2);
+  }
 
-  // ---- left card: signal bars, dBm, closer/farther ----
+  // ---- left card: bars, dBm, direction ----
   const int lx = 5, ly = 42, lw = 138, lh = 50;
   cv.fillSmoothRoundRect(lx, ly, lw, lh, 10, CARD2);
   int bars = (int)lroundf((ema + 100.0f) / 12.0f); if (bars < 0) bars = 0; if (bars > 5) bars = 5;
   int barBottom = ly + 30, barX = lx + 14;
   for (int i = 0; i < 5; ++i) {
-    int hh = 6 + i * 4, x = barX + i * 8, yy = barBottom - hh;
+    int hh = 7 + i * 4, x = barX + i * 8, yy = barBottom - hh;
     cv.fillSmoothRoundRect(x, yy, 5, hh, 1, (i < bars) ? ACC : DIMBAR);
   }
   char dbm[12]; snprintf(dbm, sizeof(dbm), "%d dBm", rint);
   fontBody(); cv.setTextDatum(bottom_left); cv.setTextColor(live ? FG : MUTE, CARD2);
   cv.drawString(dbm, lx + 14, ly + lh - 8);
-  int ax = lx + 104, ay = ly + 19;
+  int ax = lx + 112, ay = ly + 18;                        // direction column, clear of the dBm
   const char* dirw; uint16_t dirc;
   if      (trend >  2.0f) { dirw = "closer";  dirc = ACC;
-    cv.fillTriangle(ax-7, ay+2, ax+7, ay+2, ax, ay-8, dirc); cv.fillRect(ax-2, ay+2, 4, 8, dirc); }
+    cv.fillTriangle(ax-6, ay+2, ax+6, ay+2, ax, ay-7, dirc); cv.fillRect(ax-2, ay+2, 4, 7, dirc); }
   else if (trend < -2.0f) { dirw = "farther"; dirc = isTrk ? COL_HEAD : MUTE;
-    cv.fillTriangle(ax-7, ay-2, ax+7, ay-2, ax, ay+8, dirc); cv.fillRect(ax-2, ay-8, 4, 8, dirc); }
+    cv.fillTriangle(ax-6, ay-2, ax+6, ay-2, ax, ay+7, dirc); cv.fillRect(ax-2, ay-7, 4, 7, dirc); }
   else                    { dirw = "holding"; dirc = MUTE;
-    cv.fillRect(ax-7, ay-1, 14, 3, dirc); }
-  fontBody(); cv.setTextDatum(top_center); cv.setTextColor(dirc, CARD2);
-  cv.drawString(dirw, ax, ly + lh - 22);
+    cv.fillRect(ax-6, ay-1, 12, 3, dirc); }
+  fontSmall(); cv.setTextDatum(top_center); cv.setTextColor(dirc, CARD2);   // small so it can't hit the dBm
+  cv.drawString(dirw, ax, ly + lh - 20);
 
-  // ---- right card: RSSI sparkline + closest distance ----
+  // ---- right card: sparkline + closest ----
   const int rx = lx + lw + 4, ry = 42, rh = 50, rw = W - 5 - rx;
   cv.fillSmoothRoundRect(rx, ry, rw, rh, 10, CARD2);
   int gx0 = rx + 8, gx1 = rx + rw - 8, gy0 = ry + 8, gy1 = ry + 30;
-  if (histN >= 2) {
-    auto ymap = [&](int8_t v){ float t=((float)v+90.0f)/50.0f; if(t<0)t=0; if(t>1)t=1; return (int)(gy1-t*(gy1-gy0)); };
-    int px = gx0, py = ymap(hist[0]);
-    for (int i = 1; i < histN; ++i) {
-      int cx = gx0 + (gx1 - gx0) * i / (histN - 1), cy = ymap(hist[i]);
-      cv.drawLine(px, py, cx, cy, ACC); cv.drawLine(px, py+1, cx, cy+1, ACC);
-      px = cx; py = cy;
-    }
-    cv.fillSmoothCircle(px, py, 5, lerp565(CARD2, ACC, 0.35f));
-    cv.fillSmoothCircle(px, py, 3, ACC);
-  } else {
-    fontSmall(); cv.setTextDatum(middle_center); cv.setTextColor(MUTE, CARD2);
-    cv.drawString("sampling", (gx0 + gx1) / 2, (gy0 + gy1) / 2);
+  auto ymap = [&](int8_t v){ float t=((float)v+90.0f)/50.0f; if(t<0)t=0; if(t>1)t=1; return (int)(gy1-t*(gy1-gy0)); };
+  int px = gx0, py = ymap(hist[0]);
+  for (int i = 1; i < histN; ++i) {
+    int cx = gx0 + (gx1 - gx0) * i / (histN - 1), cy = ymap(hist[i]);
+    cv.drawLine(px, py, cx, cy, ACC); cv.drawLine(px, py + 1, cx, cy + 1, ACC);
+    px = cx; py = cy;
   }
+  cv.fillSmoothCircle(px, py, 5, lerp565(CARD2, ACC, 0.35f));
+  cv.fillSmoothCircle(px, py, 3, ACC);
   float dm = powf(10.0f, ((float)(-59) - (float)peak) / 25.0f);
   char cm[16];
   if (dm < 1.0f) snprintf(cm, sizeof(cm), "closest <1 m");
@@ -1283,12 +1466,18 @@ static void drawDetailScreen() {
   fontSmall(); cv.setTextDatum(bottom_center); cv.setTextColor(MUTE, CARD2);
   cv.drawString(cm, rx + rw / 2, ry + rh - 8);
 
-  // ---- bottom: id + co-presence, and the mute / back pill ----
+  // ---- bottom: id (only if it adds info) + co-presence, and the pill ----
   bool nw = false; unsigned long fs = rfFirstSeen(r.mac, &nw);
   unsigned long secs = fs ? (millis() - fs) / 1000 : 0;
-  char idline[44];
-  if (secs >= 60) snprintf(idline, sizeof(idline), "id %.11s  \xB7  with you %lum", r.mac, secs / 60);
-  else            snprintf(idline, sizeof(idline), "id %.11s  \xB7  with you %lus", r.mac, secs);
+  const char* du = isTrk ? "with you" : "seen";
+  char idline[48];
+  if (named) {
+    if (secs >= 60) snprintf(idline, sizeof(idline), "id %.11s  \xB7  %s %lum", r.mac, du, secs / 60);
+    else            snprintf(idline, sizeof(idline), "id %.11s  \xB7  %s %lus", r.mac, du, secs);
+  } else {                                                 // banner already shows the MAC -> don't repeat it
+    if (secs >= 60) snprintf(idline, sizeof(idline), "%s %lum", du, secs / 60);
+    else            snprintf(idline, sizeof(idline), "%s %lus", du, secs);
+  }
 
   fontSmall();
   char pill[18]; uint16_t pbg, pfg;
@@ -1312,7 +1501,7 @@ static void drawDetailScreen() {
 // ---------------------------------------------------------------------------
 static void drawSetupScreen() {
   cv.fillRect(0, 0, W, H, BG);
-  drawTopBar("Setup");
+  // headerless — settings glyph (bottom-right); battery is now a row
 
   if (!g_portal_active) {
     bool wup = (WiFi.status() == WL_CONNECTED);
@@ -1322,43 +1511,48 @@ static void drawSetupScreen() {
       int cy = y + 14;
       int rightEdge = dot ? (W - 28) : (W - 14);
       fontSmall(); cv.setTextDatum(middle_left); cv.setTextColor(MUTE, CARD);
-      cv.setClipRect(16, y, 60, 28);                  // label stays in its own column
+      cv.setClipRect(16, y, 60, 28);
       cv.drawString(lab, 16, cy);
       cv.clearClipRect();
       fontBody(); cv.setTextDatum(middle_right); cv.setTextColor(FG, CARD);
-      cv.setClipRect(82, y, rightEdge - 82, 28);      // value right-aligned, can't hit the label
+      cv.setClipRect(82, y, rightEdge - 82, 28);
       cv.drawString(val, rightEdge, cy - 1);
       cv.clearClipRect();
       if (dot) cv.fillSmoothCircle(W - 16, cy, 4, dotOk ? VERD : COL_BAD);
     };
 
     const char* ssid = g_cfg.ssid.length() ? g_cfg.ssid.c_str() : "(not set)";
-    inforow(28, "WIFI", ssid, true, wup);
+    inforow(6,  "WIFI", ssid, true, wup);
     char loc[24]; snprintf(loc, sizeof(loc), "%.2f, %.2f", g_cfg.lat, g_cfg.lon);
-    inforow(60, "LOCATION", loc, false, false);
+    inforow(38, "LOCATION", loc, false, false);
 
-    int ay = 92, ah = 38;
+    int  pct = battPctFromMv(M5.Power.getBatteryVoltage());
+    bool chg = M5.Power.isCharging();
+    char bs[12]; snprintf(bs, sizeof(bs), chg ? "%d%%  +" : "%d%%", pct);
+    inforow(70, "BATTERY", bs, true, chg || pct > 20);
+
+    int ay = 102, ah = 28;
     drawCard(4, ay, 232, ah, LILAC, false);
-    fontBody(); cv.setTextDatum(top_left); cv.setTextColor(HEAD_FG, LILAC);
-    cv.drawString("Setup portal", 16, ay + 7);
-    fontSmall(); cv.setTextColor(rgb565(0x5A,0x4E,0x80), LILAC);
-    cv.drawString("hold B to start", 16, ay + 25);
+    fontBody(); cv.setTextDatum(middle_left); cv.setTextColor(HEAD_FG, LILAC);
+    cv.drawString("Setup portal", 16, ay + ah / 2);
+    fontSmall(); cv.setTextDatum(middle_right); cv.setTextColor(rgb565(0x5A,0x4E,0x80), LILAC);
+    cv.drawString("hold B", W - 14, ay + ah / 2);
 
   } else {
     unsigned long elapsed = millis() - g_portal_start;
     unsigned long rem = elapsed < kPortalTimeoutMs ? (kPortalTimeoutMs - elapsed) / 1000 : 0;
 
-    drawCard(4, 28, 232, 44, LILAC, false);
+    drawCard(4, 6, 232, 44, LILAC, false);
     fontSmall(); cv.setTextDatum(top_left); cv.setTextColor(rgb565(0x5A,0x4E,0x80), LILAC);
-    cv.drawString("join wifi", 16, 35);
-    fontBody(); cv.setTextColor(HEAD_FG, LILAC); cv.drawString("Aware-Setup", 16, 48);
+    cv.drawString("join wifi", 16, 13);
+    fontBody(); cv.setTextColor(HEAD_FG, LILAC); cv.drawString("Aware-Setup", 16, 26);
 
-    drawCard(4, 78, 232, 28, CARD, false);
-    fontSmall(); cv.setTextDatum(middle_left); cv.setTextColor(MUTE, CARD); cv.drawString("OPEN", 16, 92);
-    fontBody(); cv.setTextColor(FG, CARD); cv.drawString("192.168.4.1", 70, 92);
+    drawCard(4, 56, 232, 28, CARD, false);
+    fontSmall(); cv.setTextDatum(middle_left); cv.setTextColor(MUTE, CARD); cv.drawString("OPEN", 16, 70);
+    fontBody(); cv.setTextColor(FG, CARD); cv.drawString("192.168.4.1", 70, 70);
 
     char timer[28]; snprintf(timer, sizeof(timer), "timeout %lus  -  A exits", rem);
-    fontSmall(); cv.setTextDatum(top_left); cv.setTextColor(MUTE, BG); cv.drawString(timer, 8, 113);
+    fontSmall(); cv.setTextDatum(top_left); cv.setTextColor(MUTE, BG); cv.drawString(timer, 8, 92);
   }
 }
 
@@ -1379,7 +1573,138 @@ static void drawSrcBadge(int x, int y, uint8_t src) {
 }
 
 // ---------------------------------------------------------------------------
+// --- corner identity glyph -------------------------------------------------
+// White line-art mark, top-right. Bright flash on entry -> faint resting
+// watermark. Drawn AFTER the feed so it overlays. Gated to feeds in render().
+static void drawCornerGlyph() {
+  unsigned long t = millis() - g_screen_since;
+  float op; int yoff;
+  if (t < 220)      { float k = t / 220.0f;          op = 0.92f * k;          yoff = (int)(-6.0f * (1.0f - k)); }
+  else if (t < 720) { float k = (t - 220) / 500.0f;  op = 0.92f - 0.60f * k;  yoff = 0; }   // settle to ~0.32
+  else              {                                 op = 0.32f;             yoff = 0; }
+
+  const uint16_t c = lerp565(BG, rgb565(0xFF, 0xFF, 0xFF), op);
+  const int cx = (g_screen == SCR_AIRSPACE) ? 16 : (W - 16);
+  const int cy = ((g_screen == SCR_SETUP) ? (H - 15) : 15) + yoff;
+
+  switch (g_screen) {
+    case SCR_SCAN: {                                   // radiating waves
+      cv.fillSmoothCircle(cx, cy + 7, 2, c);
+      cv.drawArc(cx, cy + 7, 4, 6, 215, 325, c);
+      cv.drawArc(cx, cy + 7, 8, 10, 215, 325, c);
+      break;
+    }
+    case SCR_BLE: {                                    // bluetooth rune (2px lines)
+      auto L = [&](int x0, int y0, int x1, int y1) {
+        cv.drawLine(cx + x0,     cy + y0, cx + x1,     cy + y1, c);
+        cv.drawLine(cx + x0 + 1, cy + y0, cx + x1 + 1, cy + y1, c);
+      };
+      L(0, -8,  0,  8);     // spine
+      L(0, -8,  4, -3);     // top flag out
+      L(4, -3, -4,  3);     // top flag cross
+      L(0,  8,  4,  3);     // bottom flag out
+      L(4,  3, -4, -3);     // bottom flag cross
+      break;
+    }
+    case SCR_AIRSPACE: {                               // little plane (future)
+      cv.fillTriangle(cx,     cy - 7, cx - 2, cy - 1, cx + 2, cy - 1, c);  // nose
+      cv.fillTriangle(cx - 7, cy + 3, cx + 7, cy + 3, cx,     cy - 2, c);  // wings
+      cv.fillTriangle(cx - 3, cy + 7, cx + 3, cy + 7, cx,     cy + 2, c);  // tail
+      break;
+    }
+    case SCR_STATS: {                                  // bar chart (future)
+      cv.fillRect(cx - 6, cy + 1, 3,  5, c);
+      cv.fillRect(cx - 1, cy - 2, 3,  8, c);
+      cv.fillRect(cx + 4, cy - 5, 3, 11, c);
+      break;
+    }
+    case SCR_CONN: {                                   // node graph
+      const int ox[3] = { cx,     cx - 7, cx + 7 };
+      const int oy[3] = { cy - 7, cy + 5, cy + 5 };
+      for (int i = 0; i < 3; ++i) {
+        cv.drawLine(cx, cy, ox[i], oy[i], c);
+        cv.fillSmoothCircle(ox[i], oy[i], 2, c);
+      }
+      cv.fillSmoothCircle(cx, cy, 2, c);
+      break;
+    }
+    case SCR_SETUP: {                                  // settings sliders
+      const int kx[3] = { 4, -3, 6 };
+      for (int i = 0; i < 3; ++i) {
+        int yy = cy - 6 + i * 6;
+        cv.drawLine(cx - 8, yy, cx + 8, yy, c);
+        cv.fillSmoothCircle(cx + kx[i], yy, 2, c);
+      }
+      break;
+    }
+    default: break;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Locator output — single function so the output device (onboard speaker now,
+// hat-LEDC later) can be swapped by changing only this one call site.
+// ---------------------------------------------------------------------------
+static void locatorBeep(uint16_t freq_hz, int dur_ms) {
+  M5.Speaker.tone(freq_hz, (uint32_t)dur_ms);
+}
+
+static void drawLocateScreen() {
+  unsigned long now = millis();
+  bool lost = (g_locate_last_seen_ms == 0 || now - g_locate_last_seen_ms > kLocLostMs);
+
+  drawTopBar("LOCATE");
+  drawBottomBar("A: exit", "", "");
+
+  // Target label
+  fontBody();
+  cv.setTextDatum(middle_center);
+  cv.setTextColor(FG, BG);
+  cv.drawString(g_locate_id[0] ? g_locate_id : g_locate_mac, W / 2, CONTENT_Y + 16);
+
+  if (lost) {
+    fontSmall();
+    cv.setTextColor(COL_BAD, BG);
+    cv.drawString("SIGNAL LOST", W / 2, CONTENT_Y + 40);
+  } else {
+    // RSSI value
+    char buf[16]; snprintf(buf, sizeof(buf), "%d dBm", (int)g_rssi_smooth);
+    fontSmall();
+    cv.setTextColor(MUTE, BG);
+    cv.drawString(buf, W / 2, CONTENT_Y + 40);
+
+    // Distance hint
+    const char* hint; uint16_t hcol;
+    if      (g_rssi_smooth >= kLocNear)        { hint = "NEAR";    hcol = COL_OK;   }
+    else if (g_rssi_smooth >= -65.0f)           { hint = "CLOSE";   hcol = LILAC;    }
+    else if (g_rssi_smooth >= kLocFar + 25.0f)  { hint = "FAR";     hcol = COL_HEAD; }
+    else                                         { hint = "DISTANT"; hcol = MUTE;     }
+    fontBody();
+    cv.setTextColor(hcol, BG);
+    cv.drawString(hint, W / 2, CONTENT_Y + 60);
+
+    // RSSI bar
+    float rssi_c = (g_rssi_smooth < kLocFar) ? kLocFar : (g_rssi_smooth > kLocNear ? kLocNear : g_rssi_smooth);
+    float frac   = (rssi_c - kLocFar) / (kLocNear - kLocFar);
+    int   bx = 20, by = CONTENT_Y + 78, bw = W - 40, bh = 8;
+    cv.fillRect(bx, by, bw, bh, CARD);
+    cv.fillRect(bx, by, (int)(frac * bw), bh, hcol);
+  }
+}
+
 static void render() {
+  // FPS counter — logs every 5 s with render budget context
+  { static int s_n = 0; static unsigned long s_t = 0;
+    if (++s_n == 1 && s_t == 0) s_t = millis();
+    unsigned long nm = millis();
+    if (nm - s_t >= 5000) {
+      Serial.printf("[fps] %.1f fps  psram=%uB  sprite=%dx%d-16bpp  spi=80MHz\n",
+                    s_n * 1000.0f / (float)(nm - s_t),
+                    (unsigned)ESP.getPsramSize(), W, H);
+      s_n = 0; s_t = nm;
+    }
+  }
+  if (g_locating) { cv.fillScreen(BG); drawLocateScreen(); cv.pushSprite(0, 0); return; }
   if (g_detail) { cv.fillScreen(F_BG); drawDetailScreen(); cv.pushSprite(0, 0); return; }
   if (g_screen == SCR_AIRSPACE && g_air_detail) { cv.fillScreen(BG); drawAirspaceDetail(); cv.pushSprite(0, 0); return; }
   cv.fillScreen(COL_BG);
@@ -1391,6 +1716,7 @@ static void render() {
     case SCR_STATS:    drawStatsScreen(); break;
     case SCR_SETUP:    drawSetupScreen(); break;
   }
+  drawCornerGlyph();
   if (g_popup_until && millis() < g_popup_until) {
     const char* nm = screenName(g_screen);
     fontBody();
@@ -1409,7 +1735,15 @@ static void render() {
 // ---------------------------------------------------------------------------
 void setup() {
   auto cfg = M5.config();
+  cfg.output_power = false;       // do not raise EXT_5V at boot — silences Speaker Hat (PAM8303 on floating input)
   M5.begin(cfg);
+  M5.Power.setExtOutput(false);   // belt-and-suspenders: keep Hat/Grove 5V off
+  M5.Speaker.begin();
+  M5.Speaker.setVolume(150);      // ~59% — clean on battery; stay <75% (200) to avoid brownout
+  M5.Speaker.playWav(aware_boot_wav, aware_boot_wav_len);  // boot chime — non-blocking (DMA)
+  g_aircraft_va.init(aircraft_wav, aircraft_wav_len, 9000);
+  g_drone_va.init(drone_wav,    drone_wav_len,    9000);
+  g_tracker_va.init(tracker_wav, tracker_wav_len, 60000);
   Serial.printf("PSRAM: %u bytes\n", (unsigned)ESP.getPsramSize());
   setCpuFrequencyMhz(160);
   M5.Display.setRotation(1);
@@ -1425,6 +1759,14 @@ void setup() {
       Serial.println("FATAL: createSprite failed");
       for (;;) delay(1000);                  // fail loudly instead of crashing in pushSprite
     }
+  }
+
+  // --- experimental: raise the panel SPI write clock to shorten full-frame pushes ---
+  {
+    auto bus = reinterpret_cast<lgfx::Bus_SPI*>(M5.Display.getPanel()->getBus());
+    auto bc  = bus->config();
+    bc.freq_write = 80000000;                  // try 80 MHz (default is ~40); halves the push time
+    bus->config(bc);
   }
 
   {
@@ -1486,26 +1828,74 @@ void loop() {
     if (millis() - g_portal_start > kPortalTimeoutMs) stopConfigPortal();
   }
 
-  // BtnA click: scroll screens (always)
+  // BtnA click: exit cursor / exit locating / exit detail / cycle screens
   if (M5.BtnA.wasClicked()) {
-    if      (g_portal_active) stopConfigPortal();
+    if      (g_cursor_mode && (g_screen == SCR_SCAN || g_screen == SCR_BLE))
+                              { g_cursor_mode = false; g_feed_manual = false; }
+    else if (g_locating)      { g_locating = false; }
+    else if (g_portal_active) stopConfigPortal();
     else if (g_detail)        g_detail = false;          // back to the list
     else                      gotoScreen(g_screen + 1);
     render();
   }
 
-  // BtnA long-press: toggle pause / unpause the feed (SCAN or BLE)
+  // BtnA long-press: from BLE/SCAN detail → enter locator; otherwise toggle pause
   if (M5.BtnA.wasHold() && (g_screen == SCR_SCAN || g_screen == SCR_BLE || g_screen == SCR_AIRSPACE)) {
-    g_paused = !g_paused;
-    if (!g_paused) g_detail = false;   // freezing keeps your current cursor row
+    if ((g_screen == SCR_SCAN || g_screen == SCR_BLE) && g_detail) {
+      strncpy(g_locate_mac, g_detail_row.mac, sizeof(g_locate_mac) - 1);
+      g_locate_mac[sizeof(g_locate_mac) - 1] = '\0';
+      strncpy(g_locate_id,  g_detail_row.id,  sizeof(g_locate_id)  - 1);
+      g_locate_id[sizeof(g_locate_id) - 1] = '\0';
+      g_rssi_smooth         = (float)g_detail_row.rssi;
+      g_locate_last_seen_ms = millis();
+      g_locate_last_beep_ms = 0;
+      g_locating            = true;
+    } else {
+      g_paused = !g_paused;
+      if (!g_paused) g_detail = false;
+    }
     render();
   }
 
-  // BtnB click: live = change filter; paused = scroll; in item = next contact
+  // BtnB click: feed = enter cursor / select entry; airspace = cycle; setup = portal
   if (M5.BtnB.wasClicked()) {
     if (g_screen == SCR_SCAN || g_screen == SCR_BLE) {
-      g_feed_manual = true; g_feed_touch = millis();
-      if (g_dispN > 0) { g_scan_sel = (g_scan_sel + 1) % g_dispN; if (g_detail) g_detail_row = g_disp[g_scan_sel]; }
+      if (g_detail) {
+        // in detail: cycle selection (legacy behaviour)
+        if (g_dispN > 0) { g_scan_sel = (g_scan_sel + 1) % g_dispN; g_detail_row = g_disp[g_scan_sel]; }
+      } else if (g_cursor_mode) {
+        // cursor active: B click selects the highlighted entry
+        if (g_dispN > 0 && g_scan_sel >= 0 && g_scan_sel < g_dispN) {
+          RfRow& sel = g_disp[g_scan_sel];
+          if (sel.src == drone::SRC_BLE) {
+            // BLE entry → enter locator mode directly
+            strncpy(g_locate_mac, sel.mac, sizeof(g_locate_mac) - 1);
+            g_locate_mac[sizeof(g_locate_mac) - 1] = '\0';
+            strncpy(g_locate_id,  sel.id,  sizeof(g_locate_id)  - 1);
+            g_locate_id[sizeof(g_locate_id) - 1] = '\0';
+            g_rssi_smooth         = (float)sel.rssi;
+            g_locate_last_seen_ms = millis();
+            g_locate_last_beep_ms = 0;
+            g_locating            = true;
+            g_cursor_mode = false; g_feed_manual = false;
+          } else {
+            // non-BLE → open detail view
+            g_detail_row = sel; g_detail = true;
+            g_cursor_mode = false; g_feed_manual = false;
+          }
+        }
+      } else {
+        // cursor inactive: B click enters cursor mode at the current top-of-viewport row
+        g_cursor_mode = true; g_feed_manual = true; g_feed_touch = millis();
+        g_cursor_idle_ms = millis(); g_pitch_armed = true;
+        if (g_dispN > 0) {
+          if (g_scan_sel < 0) g_scan_sel = 0;
+          if (g_scan_sel >= g_dispN) g_scan_sel = g_dispN - 1;
+          strncpy(g_cursor_mac, g_disp[g_scan_sel].mac, 17);
+          g_cursor_mac[17] = '\0';
+        }
+        g_cursor_anim_y = (float)(g_scan_sel * F_ROW_H);  // seed: no jump on entry
+      }
     } else if (g_screen == SCR_AIRSPACE) {
       if (g_air_count > 0) g_airspace_sel = (g_airspace_sel + 1) % g_air_count;
     } else if (g_screen == SCR_SETUP && !g_portal_active) {
@@ -1524,7 +1914,10 @@ void loop() {
         services::adsb::setCenter(g_cfg.lat, g_cfg.lon, rangeKm() * 1.3f);
       }
     } else if (g_screen == SCR_SCAN || g_screen == SCR_BLE) {
-      if (g_detail) {
+      if (g_cursor_mode && !g_detail) {
+        // B hold exits cursor mode
+        g_cursor_mode = false; g_feed_manual = false;
+      } else if (g_detail) {
         if (g_detail_row.tracker != drone::TRK_NONE) muteAdd(g_detail_row.mac, 3600000UL);  // mute 1h
         else g_detail = false;
       } else if (g_dispN > 0) {
@@ -1546,36 +1939,112 @@ void loop() {
         g_lastAdsbOkMs = ok_ms;
         recomputePlanes();
         if (g_pcount > 0) g_lastDataMs = now;
+        {
+          const services::adsb::Aircraft* L = services::adsb::aircraftList();
+          size_t nac = services::adsb::aircraftCount();
+          const char* ids[64];
+          for (size_t i = 0; i < nac; ++i) ids[i] = L[i].callsign;
+          if (!g_locating) g_aircraft_va.check(ids, (int)nac, g_screen == SCR_AIRSPACE);
+        }
         if (g_screen == SCR_AIRSPACE) render();
       }
     }
   }
 
   static unsigned long last_prune = 0;
-  if (now - last_prune > 2000) { last_prune = now; drone::prune(); }
+  if (now - last_prune > 2000) {
+    last_prune = now;
+    drone::prune();
 
-  // IMU: auto-rotate (low-pass + dominant-axis, animated) + motion-idle (~10 Hz)
+    // Drone announcement: prefer Remote ID serial as dedup key; fall back to MAC.
+    // Both BLE and C5 WiFi drones share the same s_tab, so one snapshot covers both.
+    {
+      drone::Drone dr[12]; int nd = (int)drone::snapshot(dr, 12);
+      const char* ids[12];
+      for (int i = 0; i < nd; ++i) ids[i] = dr[i].id[0] ? dr[i].id : dr[i].mac;
+      if (!g_locating) g_drone_va.check(ids, nd, g_screen == SCR_AIRSPACE);
+    }
+
+    // Tracker announcement: only fire for "following" contacts —
+    // those with sustained proximity (RSSI) and presence over kFollowPersistMs.
+    // MAC is the only key; rotation resets the clock (acceptable — see threshold notes above).
+    {
+      drone::BleSight bl[24]; int nb = (int)drone::bleSnapshot(bl, 24);
+      const char* ids[24]; int ntrk = 0;
+      for (int i = 0; i < nb; ++i) {
+        if (bl[i].tracker == drone::TRK_NONE) continue;
+        if (bl[i].rssi < kFollowRssiMin) continue;
+        if (now - bl[i].first_seen_ms < kFollowPersistMs) continue;
+        ids[ntrk++] = bl[i].mac;
+      }
+      if (!g_locating) g_tracker_va.check(ids, ntrk, g_screen == SCR_BLE);
+    }
+  }
+
+  // Locator mode: poll BLE table for target RSSI and drive the beep engine
+  if (g_locating) {
+    static unsigned long s_loc_poll = 0;
+    if (now - s_loc_poll >= 100) {
+      s_loc_poll = now;
+      drone::BleSight bl[24]; int nb = (int)drone::bleSnapshot(bl, 24);
+      for (int i = 0; i < nb; ++i) {
+        if (strncmp(bl[i].mac, g_locate_mac, 17) == 0) {
+          g_rssi_smooth += kLocAlpha * ((float)bl[i].rssi - g_rssi_smooth);
+          g_locate_last_seen_ms = now;
+          break;
+        }
+      }
+      render();
+    }
+    bool lost = (now - g_locate_last_seen_ms > kLocLostMs);
+    if (lost) {
+      if (now - g_locate_last_beep_ms >= kLocSearchPeriod) {
+        locatorBeep(kLocSearchFreq, kLocSearchDurMs);
+        g_locate_last_beep_ms = now;
+      }
+    } else if (g_rssi_smooth >= kLocNear) {
+      // Very close: near-continuous rapid beep
+      if (now - g_locate_last_beep_ms >= (unsigned long)kLocFastMs) {
+        locatorBeep(kLocFreq, kLocDurMs);
+        g_locate_last_beep_ms = now;
+      }
+    } else {
+      float rssi_c = (g_rssi_smooth < kLocFar) ? kLocFar : g_rssi_smooth;
+      float t = (rssi_c - kLocFar) / (kLocNear - kLocFar);
+      unsigned long interval = (unsigned long)(kLocSlowMs + (float)(kLocFastMs - kLocSlowMs) * t);
+      if (now - g_locate_last_beep_ms >= interval) {
+        locatorBeep(kLocFreq, kLocDurMs);
+        g_locate_last_beep_ms = now;
+      }
+    }
+  }
+
+  // IMU: gesture + auto-rotate + motion-idle at 100 Hz (10 ms)
+  // LP k scaled from original 0.15 @ 50 ms → 0.033 @ 10 ms (same ~300 ms time constant).
   static unsigned long last_imu    = 0;
   static float         gx = 0, gy = 0, gz = 0;  // low-pass gravity estimate
   static float         last_mag    = 1.0f;
-  if (now - last_imu > 50) {
+  if (now - last_imu > 10) {
     last_imu = now;
     float ax, ay, az;
     M5.Imu.update();
     M5.Imu.getAccel(&ax, &ay, &az);
-    const float k = 0.15f;
+    const float k = 0.033f;   // preserves ~300 ms LP time constant at 10 ms interval
     gx += k * (ax - gx); gy += k * (ay - gy); gz += k * (az - gz);
     float h = (fabsf(gx) >= fabsf(gy)) ? gx : gy;  // dominant horizontal axis
-    if (fabsf(h) > 0.5f && g_screen != SCR_SCAN && g_screen != SCR_BLE) {   // not while tilt-scrubbing a feed
-      static int rot = 1;
-      int want = (h > 0) ? 1 : 3;                    // swap 1 and 3 if screen ends up upside-down
-      if (want != rot) { rot = want; M5.Display.setRotation(rot); render(); }
-    }
+    // auto-rotate: limit to 20 Hz — no need to check orientation on every IMU tick
+    { static unsigned long s_rot_t = 0;
+      if (now - s_rot_t >= 50 && fabsf(h) > 0.5f && g_screen != SCR_SCAN && g_screen != SCR_BLE) {
+        s_rot_t = now;
+        static int rot = 1;
+        int want = (h > 0) ? 1 : 3;            // swap 1 and 3 if screen ends up upside-down
+        if (want != rot) { rot = want; M5.Display.setRotation(rot); render(); }
+      } }
     float mag = sqrtf(ax*ax + ay*ay + az*az);
     if (fabsf(mag - last_mag) > 0.06f) g_last_motion = now;
     last_mag = mag;
 
-    // ---- tilt-shuttle: pitch sets feed scroll velocity ----
+    // ---- tilt-shuttle: roll axis sets feed scroll velocity ----
     {
       const float TILT_SIGN = 1.0f;     // set -1 if forward tilt scrolls the wrong way
       const float TILT_DEAD = 0.18f;    // wider neutral band, ~11 deg
@@ -1584,6 +2053,7 @@ void loop() {
       if (g_tilt_neutral > 90.0f) g_tilt_neutral = tilt;          // first-run seed
       if ((g_screen == SCR_SCAN || g_screen == SCR_BLE) && !g_detail && !g_paused) {
         float e = tilt - g_tilt_neutral;
+        g_tilt_e = e;
         if (e > TILT_DEAD) {                                      // tip forward -> faster down
           g_feed_vel = TICKER_PXPS + (e - TILT_DEAD) * TILT_SENS; g_tilt_scrub = true; g_tilt_dir = 1;
         } else if (e < -TILT_DEAD) {                             // tip back -> reverse (up)
@@ -1593,9 +2063,32 @@ void loop() {
         }
         if (g_feed_vel >  300.0f) g_feed_vel =  300.0f;
         if (g_feed_vel < -300.0f) g_feed_vel = -300.0f;
-        g_tilt_neutral += (g_tilt_scrub ? 0.008f : 0.05f) * (tilt - g_tilt_neutral);  // re-center
+        // neutral re-center — k scaled for 10 ms to preserve original time constants (~975 ms / ~6.2 s)
+        g_tilt_neutral += (g_tilt_scrub ? 0.0016f : 0.010f) * (tilt - g_tilt_neutral);
       } else {
-        g_feed_vel = TICKER_PXPS; g_tilt_scrub = false; g_tilt_dir = 0;
+        g_feed_vel = TICKER_PXPS; g_tilt_scrub = false; g_tilt_dir = 0; g_tilt_e = 0.0f;
+      }
+    }
+
+    // ---- cursor mode: pitch-based discrete up/down (one step per gesture) ----
+    // Axis: gy (pitch, forward/back).  Flip PITCH_SIGN to -1 if up/down are reversed.
+    if (g_cursor_mode && (g_screen == SCR_SCAN || g_screen == SCR_BLE) && !g_detail) {
+      const float PITCH_SIGN = 1.0f;
+      const float PITCH_DEAD = 0.20f;   // same order as TILT_DEAD
+      float pitch = PITCH_SIGN * gy;
+      if (fabsf(pitch) <= PITCH_DEAD) {
+        g_pitch_armed = true;            // back in neutral — ready to fire next step
+      } else if (g_pitch_armed) {
+        int step = (pitch > 0) ? 1 : -1;
+        g_scan_sel += step;
+        if (g_scan_sel < 0)        g_scan_sel = 0;
+        if (g_scan_sel >= g_dispN) g_scan_sel = g_dispN > 0 ? g_dispN - 1 : 0;
+        if (g_scan_sel >= 0 && g_scan_sel < g_dispN) {
+          strncpy(g_cursor_mac, g_disp[g_scan_sel].mac, 17);
+          g_cursor_mac[17] = '\0';
+        }
+        g_pitch_armed    = false;        // consumed — require re-centre before next step
+        g_cursor_idle_ms = millis();
       }
     }
   }
@@ -1666,13 +2159,20 @@ void loop() {
   }
 
   static unsigned long last_feed = 0;
-  if ((g_screen == SCR_SCAN || g_screen == SCR_BLE) && !g_detail && now - last_feed > 24) {
+  if ((g_screen == SCR_SCAN || g_screen == SCR_BLE) && !g_detail && now - last_feed > 16) {
     last_feed = now; render();
   }
   static unsigned long last_air = 0;
   if (g_screen == SCR_AIRSPACE && !g_air_detail && now - last_air > 33) { last_air = now; render(); }
 
   if (g_popup_until && now >= g_popup_until) { g_popup_until = 0; render(); }
+
+  // cursor idle timeout: 8 s without a pitch gesture exits cursor mode
+  if (g_cursor_mode && (g_screen == SCR_SCAN || g_screen == SCR_BLE) &&
+      now - g_cursor_idle_ms > 8000UL) {
+    g_cursor_mode = false; g_feed_manual = false;
+    render();
+  }
 
   static unsigned long last_idle = 0;
   if (now - last_idle > 1000) { last_idle = now; render(); }
@@ -1694,5 +2194,5 @@ void loop() {
     }
   }
 
-  delay(10);
+  delay(1);
 }
