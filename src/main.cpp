@@ -2090,34 +2090,27 @@ void loop() {
     //      HOLD to walk ~4/sec); return to that hold position to stop.
     {
       static bool  s_was     = false;
-      static int   s_dir     = 0;
-      static unsigned long s_next = 0;
+      static int   s_latch   = 0;     // 0 = armed (ready); ±1 = already stepped, waiting to re-arm
       static float s_neutral = 0.0f;
       bool active = g_cursor_mode && (g_screen == SCR_SCAN || g_screen == SCR_BLE) && !g_detail;
       if (active) {
-        const float STEP_SIGN = 1.0f;          // flip to -1 if up/down come out reversed
-        const float STEP_DEAD = 0.12f;         // tilt (g) from the captured reference to step
-        const unsigned long FIRST_MS  = 300;   // a quick tilt returning inside this = ONE step
-        const unsigned long REPEAT_MS = 260;   // held -> ~4 entries/sec
-        if (!s_was) { s_neutral = gx; s_dir = 0; s_was = true; }   // capture fixed reference on entry
-        float e = STEP_SIGN * (gx - s_neutral);                    // stable: does NOT drift
-        int dir = (e >= STEP_DEAD) ? 1 : (e <= -STEP_DEAD) ? -1 : 0;
-        g_dbg_cur_e = e; g_dbg_cur_dir = dir;       // DEBUG readout
-        if (dir == 0) {
-          s_dir = 0;                            // back at reference — ready for the next step
-        } else {
-          unsigned long t = millis();
-          bool fire = false;
-          if (dir != s_dir)     { fire = true; s_dir = dir; s_next = t + FIRST_MS; }  // first step now
-          else if (t >= s_next) { fire = true; s_next = t + REPEAT_MS; }              // held -> steady walk
-          if (fire && g_dispN > 0) {
-            g_scan_sel += dir;
-            if (g_scan_sel < 0)        g_scan_sel = 0;
-            if (g_scan_sel >= g_dispN) g_scan_sel = g_dispN - 1;
-            strncpy(g_cursor_mac, g_disp[g_scan_sel].mac, 17);
-            g_cursor_mac[17] = '\0';
-            g_cursor_idle_ms = millis();
-          }
+        const float STEP_SIGN = 1.0f;   // flip to -1 if up/down come out reversed
+        const float FIRE  = 0.14f;      // tilt past this (g) from your hold reference = ONE step
+        const float REARM = 0.06f;      // return inside this before it will step again
+        if (!s_was) { s_neutral = gx; s_latch = 0; s_was = true; }  // capture fixed reference on entry
+        float e = STEP_SIGN * (gx - s_neutral);                     // stable: does NOT drift
+        g_dbg_cur_e = e; g_dbg_cur_dir = s_latch;                   // DEBUG readout
+        if (fabsf(e) < REARM) {
+          s_latch = 0;                  // back near the hold position — re-armed for the next step
+        } else if (s_latch == 0 && fabsf(e) >= FIRE && g_dispN > 0) {
+          int d = (e > 0) ? 1 : -1;     // ONE step per tilt — cannot run away
+          g_scan_sel += d;
+          if (g_scan_sel < 0)        g_scan_sel = 0;
+          if (g_scan_sel >= g_dispN) g_scan_sel = g_dispN - 1;
+          strncpy(g_cursor_mac, g_disp[g_scan_sel].mac, 17);
+          g_cursor_mac[17] = '\0';
+          g_cursor_idle_ms = millis();
+          s_latch = d;                  // fired — locked until you return toward neutral
         }
       } else {
         s_was = false;                          // left cursor mode — recapture neutral next entry
