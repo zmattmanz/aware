@@ -1837,8 +1837,10 @@ void loop() {
   // BtnA click: exit cursor / exit locating / exit detail / cycle screens
   if (M5.BtnA.wasClicked()) {
     if (g_cursor_mode && (g_screen == SCR_SCAN || g_screen == SCR_BLE)) {
-      if (millis() - g_cursor_idle_ms > 300 && fabsf(g_dbg_cur_e) < 0.08f)  // ignore entry tail-click AND accidental squeezes while tilted
-        { g_cursor_mode = false; g_feed_manual = false; }
+      // A is INERT while picking. Rolling the stick to tilt squeezes this front button,
+      // and a click can land at ANY tilt value, so no threshold can safely allow a cancel
+      // here. Leaving A dead in cursor mode is the only reliable fix. To exit without
+      // choosing: B-hold. To choose: level the device, then click B.
     }
     else if (g_locating)      { g_locating = false; }
     else if (g_portal_active) stopConfigPortal();
