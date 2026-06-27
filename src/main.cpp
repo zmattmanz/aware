@@ -1048,7 +1048,7 @@ static void drawBleScreen() {
   cv.fillRect(0, 0, W, H, BG);
 
   static unsigned long s_bleBuild = 0;
-  if (!g_paused && (g_dispN == 0 || millis() - s_bleBuild > 250)) {
+  if (!g_paused && !g_cursor_mode && (g_dispN == 0 || millis() - s_bleBuild > 250)) {   // frozen while picking
     drone::BleSight b[24]; size_t n = drone::bleSnapshot(b, 24);
     for (size_t i = 0; i < n; ++i) {
       bool isTrk = b[i].tracker != drone::TRK_NONE;
@@ -1177,9 +1177,12 @@ static void drawFeedList(const RfRow* rows, int n, int top, int win) {
     }
     if (topIdx >= 0) g_scan_sel = topIdx;            // drill target = the row currently at the top
   } else {
-    // cursor mode: g_cursor_anim_y is driven by the IMU glide (primary, smooth).
-    // Non-cursor manual (e.g. B-hold drill): snap to the selected row.
-    if (!g_cursor_mode) g_cursor_anim_y = (float)(g_scan_sel * ROW);
+    // highlight slides toward the selected entry (animated glide); snap in non-cursor manual
+    float anim_target = (float)(g_scan_sel * ROW);
+    if (g_cursor_mode)
+      g_cursor_anim_y += (anim_target - g_cursor_anim_y) * (1.0f - expf(-dt / 70.0f));
+    else
+      g_cursor_anim_y = anim_target;
     int anim_sel = (int)lroundf(g_cursor_anim_y / ROW);
     if (anim_sel < 0) anim_sel = 0;
     if (anim_sel >= n) anim_sel = n - 1;
@@ -1268,7 +1271,7 @@ static void drawScanScreen() {
   cv.fillRect(0, 0, W, H, BG);
 
   static unsigned long s_scanBuild = 0;
-  if (!g_paused && (g_dispN == 0 || millis() - s_scanBuild > 250)) {   // merge-refresh 4 Hz; scroll 30 fps
+  if (!g_paused && !g_cursor_mode && (g_dispN == 0 || millis() - s_scanBuild > 250)) {   // merge-refresh 4 Hz; frozen while picking
     char home_ssid[33]; home_ssid[0] = '\0';
     if (g_hide_home && WiFi.status() == WL_CONNECTED) {
       strncpy(home_ssid, WiFi.SSID().c_str(), sizeof(home_ssid)-1); home_ssid[sizeof(home_ssid)-1]='\0'; }
@@ -1840,7 +1843,7 @@ void loop() {
   //                  row (enter-only); detail -> locate this row; airspace -> pause
   if (M5.BtnA.wasHold()) {
     if ((g_screen == SCR_SCAN || g_screen == SCR_BLE) && !g_detail) {
-      if (!g_cursor_mode) {                        // enter only — never toggle out here
+      if (!g_cursor_mode && g_dispN > 0) {         // enter only (need entries to pick) — never toggle out
         g_cursor_mode = true; g_feed_manual = true; g_feed_touch = millis();
         g_cursor_idle_ms = millis();
         if (g_dispN > 0) {
@@ -2072,35 +2075,33 @@ void loop() {
       }
     }
 
-    // ---- cursor mode: tilt GLIDES the highlight smoothly through entries. Tilt
-    //      magnitude = glide speed (a little = drift, more = fast); level off and it
-    //      eases onto the nearest entry. Same calibrated roll axis as scrolling.
+    // ---- cursor mode: tilt moves the highlight one entry at a time, CONTROLLABLY.
+    //      A quick tilt that returns = exactly one step; HOLD the tilt to walk steadily
+    //      (~4 entries/sec). Movement is per-step, not momentum, so it never runs away.
+    //      The highlight slides to the new entry (animated in the draw). Same roll axis.
     if (g_cursor_mode && (g_screen == SCR_SCAN || g_screen == SCR_BLE) && !g_detail) {
-      const float GLIDE_SIGN = 1.0f;     // flip to -1 if up/down come out reversed
-      const float GLIDE_DEAD = 0.10f;    // tilt (g, from neutral) before it moves
-      const float GLIDE_SENS = 26.0f;    // rows/sec per g past the deadzone
-      const float GLIDE_MAX  = 14.0f;    // rows/sec cap
-      const float dt_s = 0.010f;         // this IMU block runs every ~10 ms
-      float e   = GLIDE_SIGN * g_tilt_e;
-      float mag = fabsf(e) - GLIDE_DEAD;
-      if (mag > 0.0f && g_dispN > 0) {                       // gliding
-        float vps = mag * GLIDE_SENS; if (vps > GLIDE_MAX) vps = GLIDE_MAX;
-        g_cursor_anim_y += (e > 0 ? vps : -vps) * F_ROW_H * dt_s;   // integrate (px)
-        float maxY = (float)((g_dispN - 1) * F_ROW_H);
-        if (g_cursor_anim_y < 0)    g_cursor_anim_y = 0;
-        if (g_cursor_anim_y > maxY) g_cursor_anim_y = maxY;
-        g_cursor_idle_ms = millis();
-      } else if (g_dispN > 0) {                              // level — settle to nearest entry
-        float tgtY = lroundf(g_cursor_anim_y / F_ROW_H) * (float)F_ROW_H;
-        g_cursor_anim_y += (tgtY - g_cursor_anim_y) * 0.25f;
-      }
-      if (g_dispN > 0) {                                     // selection follows the glide
-        int sel = (int)lroundf(g_cursor_anim_y / F_ROW_H);
-        if (sel < 0) sel = 0; if (sel >= g_dispN) sel = g_dispN - 1;
-        if (sel != g_scan_sel) {
-          g_scan_sel = sel;
+      const float STEP_SIGN = 1.0f;          // flip to -1 if up/down come out reversed
+      const float STEP_DEAD = 0.12f;         // tilt (g, from neutral) to register a step
+      const unsigned long FIRST_MS  = 300;   // a quick tilt returning inside this = ONE step
+      const unsigned long REPEAT_MS = 260;   // held -> ~4 entries/sec (controllable)
+      static unsigned long s_next = 0;
+      static int s_dir = 0;
+      float e = STEP_SIGN * g_tilt_e;
+      int dir = (e >= STEP_DEAD) ? 1 : (e <= -STEP_DEAD) ? -1 : 0;
+      if (dir == 0) {
+        s_dir = 0;                            // level — ready for the next step
+      } else {
+        unsigned long t = millis();
+        bool fire = false;
+        if (dir != s_dir)     { fire = true; s_dir = dir; s_next = t + FIRST_MS; }  // first step now
+        else if (t >= s_next) { fire = true; s_next = t + REPEAT_MS; }              // held -> steady walk
+        if (fire && g_dispN > 0) {
+          g_scan_sel += dir;
+          if (g_scan_sel < 0)        g_scan_sel = 0;
+          if (g_scan_sel >= g_dispN) g_scan_sel = g_dispN - 1;
           strncpy(g_cursor_mac, g_disp[g_scan_sel].mac, 17);
           g_cursor_mac[17] = '\0';
+          g_cursor_idle_ms = millis();
         }
       }
     }
