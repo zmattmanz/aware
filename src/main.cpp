@@ -1829,8 +1829,10 @@ void loop() {
 
   // BtnA click: exit cursor / exit locating / exit detail / cycle screens
   if (M5.BtnA.wasClicked()) {
-    if      (g_cursor_mode && (g_screen == SCR_SCAN || g_screen == SCR_BLE))
-                              { g_cursor_mode = false; g_feed_manual = false; }
+    if (g_cursor_mode && (g_screen == SCR_SCAN || g_screen == SCR_BLE)) {
+      if (millis() - g_cursor_idle_ms > 300)  // ignore the click that tails the entering A-hold
+        { g_cursor_mode = false; g_feed_manual = false; }
+    }
     else if (g_locating)      { g_locating = false; }
     else if (g_portal_active) stopConfigPortal();
     else if (g_detail)        g_detail = false;          // back to the list
@@ -1839,12 +1841,10 @@ void loop() {
   }
 
   // BtnA long-press: feed -> FREEZE the feed + drop a cursor on the current top
-  //                  row (toggle); detail -> locate this row; airspace -> pause
+  //                  row (enter-only); detail -> locate this row; airspace -> pause
   if (M5.BtnA.wasHold()) {
     if ((g_screen == SCR_SCAN || g_screen == SCR_BLE) && !g_detail) {
-      if (g_cursor_mode) {                         // already picking -> back to live feed
-        g_cursor_mode = false; g_feed_manual = false;
-      } else {                                     // freeze here; highlight the top row
+      if (!g_cursor_mode) {                        // enter only — never toggle out here
         g_cursor_mode = true; g_feed_manual = true; g_feed_touch = millis();
         g_cursor_idle_ms = millis();
         if (g_dispN > 0) {
@@ -1854,8 +1854,8 @@ void loop() {
         }
         g_feed_scroll   = (float)(g_scan_sel * F_ROW_H);    // snap: highlighted row at top NOW
         g_cursor_anim_y = (float)(g_scan_sel * F_ROW_H);    // seed: no jump on entry
+        render();
       }
-      render();
     } else if ((g_screen == SCR_SCAN || g_screen == SCR_BLE) && g_detail) {
       strncpy(g_locate_mac, g_detail_row.mac, sizeof(g_locate_mac) - 1);
       g_locate_mac[sizeof(g_locate_mac) - 1] = '\0';
