@@ -1837,7 +1837,7 @@ void loop() {
   // BtnA click: exit cursor / exit locating / exit detail / cycle screens
   if (M5.BtnA.wasClicked()) {
     if (g_cursor_mode && (g_screen == SCR_SCAN || g_screen == SCR_BLE)) {
-      if (millis() - g_cursor_idle_ms > 300 && fabsf(g_dbg_cur_e) < 0.08f)  // ignore entry tail-click AND accidental squeezes while tilted
+      if (millis() - g_cursor_idle_ms > 300)  // ignore the click that tails the entering A-hold
         { g_cursor_mode = false; g_feed_manual = false; }
     }
     else if (g_locating)      { g_locating = false; }
@@ -1887,9 +1887,8 @@ void loop() {
         // in detail: cycle selection (legacy behaviour)
         if (g_dispN > 0) { g_scan_sel = (g_scan_sel + 1) % g_dispN; g_detail_row = g_disp[g_scan_sel]; }
       } else if (g_cursor_mode) {
-        // cursor active: B click selects the highlighted entry — only when the device is back
-        // near your hold position (|tilt|<0.08), so an accidental squeeze mid-tilt can't fire it.
-        if (fabsf(g_dbg_cur_e) < 0.08f && g_dispN > 0 && g_scan_sel >= 0 && g_scan_sel < g_dispN) {
+        // cursor active: B click selects the highlighted entry
+        if (g_dispN > 0 && g_scan_sel >= 0 && g_scan_sel < g_dispN) {
           RfRow& sel = g_disp[g_scan_sel];
           if (sel.src == drone::SRC_BLE) {
             // BLE entry → enter locator mode directly
@@ -2101,7 +2100,6 @@ void loop() {
         if (!s_was) { s_neutral = gx; s_latch = 0; s_was = true; }  // capture fixed reference on entry
         float e = STEP_SIGN * (gx - s_neutral);                     // stable: does NOT drift
         g_dbg_cur_e = e; g_dbg_cur_dir = s_latch;                   // DEBUG readout
-        if (fabsf(e) > REARM) g_cursor_idle_ms = millis();          // any active tilt keeps cursor mode alive
         if (fabsf(e) < REARM) {
           s_latch = 0;                  // back near the hold position — re-armed for the next step
         } else if (s_latch == 0 && fabsf(e) >= FIRE && g_dispN > 0) {
