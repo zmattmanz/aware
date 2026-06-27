@@ -1177,13 +1177,9 @@ static void drawFeedList(const RfRow* rows, int n, int top, int win) {
     }
     if (topIdx >= 0) g_scan_sel = topIdx;            // drill target = the row currently at the top
   } else {
-    // animate cursor highlight toward g_scan_sel; snap instantly in non-cursor manual
-    float anim_target = (float)(g_scan_sel * ROW);
-    if (g_cursor_mode) {
-      g_cursor_anim_y += (anim_target - g_cursor_anim_y) * (1.0f - expf(-dt / 55.0f));
-    } else {
-      g_cursor_anim_y = anim_target;
-    }
+    // cursor mode: g_cursor_anim_y is driven by the IMU glide (primary, smooth).
+    // Non-cursor manual (e.g. B-hold drill): snap to the selected row.
+    if (!g_cursor_mode) g_cursor_anim_y = (float)(g_scan_sel * ROW);
     int anim_sel = (int)lroundf(g_cursor_anim_y / ROW);
     if (anim_sel < 0) anim_sel = 0;
     if (anim_sel >= n) anim_sel = n - 1;
@@ -2076,33 +2072,35 @@ void loop() {
       }
     }
 
-    // ---- cursor mode: tilt to move the highlight up/down. Uses the SAME calibrated
-    //      left/right (roll) signal as scrolling — g_tilt_e is neutral-subtracted, so
-    //      it works at any hold angle. Tilt-and-hold auto-repeats; return to level to
-    //      stop. (The ticker is frozen in cursor mode, so this is unambiguous.)
+    // ---- cursor mode: tilt GLIDES the highlight smoothly through entries. Tilt
+    //      magnitude = glide speed (a little = drift, more = fast); level off and it
+    //      eases onto the nearest entry. Same calibrated roll axis as scrolling.
     if (g_cursor_mode && (g_screen == SCR_SCAN || g_screen == SCR_BLE) && !g_detail) {
-      const float STEP_SIGN = 1.0f;          // flip to -1 if up/down come out reversed
-      const float STEP_DEAD = 0.12f;         // tilt past this (g, from neutral) = move
-      const unsigned long FIRST_MS  = 420;   // delay before a held tilt starts repeating
-      const unsigned long REPEAT_MS = 170;   // step interval while held
-      static unsigned long s_next = 0;
-      static int s_dir = 0;
-      float e = STEP_SIGN * g_tilt_e;
-      int dir = (e >= STEP_DEAD) ? 1 : (e <= -STEP_DEAD) ? -1 : 0;
-      if (dir == 0) {
-        s_dir = 0;                            // back to level — disarm
-      } else {
-        unsigned long t = millis();
-        bool fire = false;
-        if (dir != s_dir)      { fire = true; s_dir = dir; s_next = t + FIRST_MS; } // first step now
-        else if (t >= s_next)  { fire = true; s_next = t + REPEAT_MS; }             // held -> repeat
-        if (fire && g_dispN > 0) {
-          g_scan_sel += dir;
-          if (g_scan_sel < 0)        g_scan_sel = 0;
-          if (g_scan_sel >= g_dispN) g_scan_sel = g_dispN - 1;
+      const float GLIDE_SIGN = 1.0f;     // flip to -1 if up/down come out reversed
+      const float GLIDE_DEAD = 0.10f;    // tilt (g, from neutral) before it moves
+      const float GLIDE_SENS = 26.0f;    // rows/sec per g past the deadzone
+      const float GLIDE_MAX  = 14.0f;    // rows/sec cap
+      const float dt_s = 0.010f;         // this IMU block runs every ~10 ms
+      float e   = GLIDE_SIGN * g_tilt_e;
+      float mag = fabsf(e) - GLIDE_DEAD;
+      if (mag > 0.0f && g_dispN > 0) {                       // gliding
+        float vps = mag * GLIDE_SENS; if (vps > GLIDE_MAX) vps = GLIDE_MAX;
+        g_cursor_anim_y += (e > 0 ? vps : -vps) * F_ROW_H * dt_s;   // integrate (px)
+        float maxY = (float)((g_dispN - 1) * F_ROW_H);
+        if (g_cursor_anim_y < 0)    g_cursor_anim_y = 0;
+        if (g_cursor_anim_y > maxY) g_cursor_anim_y = maxY;
+        g_cursor_idle_ms = millis();
+      } else if (g_dispN > 0) {                              // level — settle to nearest entry
+        float tgtY = lroundf(g_cursor_anim_y / F_ROW_H) * (float)F_ROW_H;
+        g_cursor_anim_y += (tgtY - g_cursor_anim_y) * 0.25f;
+      }
+      if (g_dispN > 0) {                                     // selection follows the glide
+        int sel = (int)lroundf(g_cursor_anim_y / F_ROW_H);
+        if (sel < 0) sel = 0; if (sel >= g_dispN) sel = g_dispN - 1;
+        if (sel != g_scan_sel) {
+          g_scan_sel = sel;
           strncpy(g_cursor_mac, g_disp[g_scan_sel].mac, 17);
           g_cursor_mac[17] = '\0';
-          g_cursor_idle_ms = millis();
         }
       }
     }
