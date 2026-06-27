@@ -127,6 +127,8 @@ static bool          g_cursor_mode   = false;      // selection cursor active on
 static char          g_cursor_mac[18] = {};         // pinned entry MAC — survives feed reorder
 static unsigned long g_cursor_idle_ms = 0;          // time of last cursor gesture (8 s timeout)
 static float         g_cursor_anim_y = 0.0f;        // animated highlight Y (pixels in list coords)
+static float         g_dbg_cur_e   = 0.0f;          // DEBUG: cursor tilt deviation from captured neutral
+static int           g_dbg_cur_dir = 0;             // DEBUG: -1/0/+1 step direction
 
 // ---------------------------------------------------------------------------
 // Locator mode — BLE proximity beep (faster = closer)
@@ -1264,6 +1266,12 @@ static void drawFeedList(const RfRow* rows, int n, int top, int win) {
     cv.fillSmoothRoundRect(W - 6 - pw, top + 4, pw, 15, 7, PILL_BG);
     cv.setTextColor(MUTE, PILL_BG); cv.setTextDatum(middle_center);
     cv.drawString(pi, W - 6 - pw / 2, top + 12);
+
+    // DEBUG: tilt readout — e (deviation from captured neutral) and step dir.
+    // At rest e should sit near 0.00; tilting should push |e| past 0.12 and dir to ±1.
+    char dbg[24]; snprintf(dbg, sizeof(dbg), "e%+.2f d%+d", g_dbg_cur_e, g_dbg_cur_dir);
+    fontSmall(); cv.setTextColor(rgb565(0x66,0xCC,0x66), BG); cv.setTextDatum(bottom_left);
+    cv.drawString(dbg, 6, H - 2);
   }
 }
 
@@ -2076,33 +2084,43 @@ void loop() {
     }
 
     // ---- cursor mode: tilt moves the highlight one entry at a time, CONTROLLABLY.
-    //      A quick tilt that returns = exactly one step; HOLD the tilt to walk steadily
-    //      (~4 entries/sec). Movement is per-step, not momentum, so it never runs away.
-    //      The highlight slides to the new entry (animated in the draw). Same roll axis.
-    if (g_cursor_mode && (g_screen == SCR_SCAN || g_screen == SCR_BLE) && !g_detail) {
-      const float STEP_SIGN = 1.0f;          // flip to -1 if up/down come out reversed
-      const float STEP_DEAD = 0.12f;         // tilt (g, from neutral) to register a step
-      const unsigned long FIRST_MS  = 300;   // a quick tilt returning inside this = ONE step
-      const unsigned long REPEAT_MS = 260;   // held -> ~4 entries/sec (controllable)
+    //      Uses a FIXED tilt reference captured the moment you enter cursor mode — NOT
+    //      the scroll's adaptive neutral, whose drift was making the cursor wander and
+    //      reverse. Tilt away from your hold position to step (quick tilt = one step;
+    //      HOLD to walk ~4/sec); return to that hold position to stop.
+    {
+      static bool  s_was     = false;
+      static int   s_dir     = 0;
       static unsigned long s_next = 0;
-      static int s_dir = 0;
-      float e = STEP_SIGN * g_tilt_e;
-      int dir = (e >= STEP_DEAD) ? 1 : (e <= -STEP_DEAD) ? -1 : 0;
-      if (dir == 0) {
-        s_dir = 0;                            // level — ready for the next step
-      } else {
-        unsigned long t = millis();
-        bool fire = false;
-        if (dir != s_dir)     { fire = true; s_dir = dir; s_next = t + FIRST_MS; }  // first step now
-        else if (t >= s_next) { fire = true; s_next = t + REPEAT_MS; }              // held -> steady walk
-        if (fire && g_dispN > 0) {
-          g_scan_sel += dir;
-          if (g_scan_sel < 0)        g_scan_sel = 0;
-          if (g_scan_sel >= g_dispN) g_scan_sel = g_dispN - 1;
-          strncpy(g_cursor_mac, g_disp[g_scan_sel].mac, 17);
-          g_cursor_mac[17] = '\0';
-          g_cursor_idle_ms = millis();
+      static float s_neutral = 0.0f;
+      bool active = g_cursor_mode && (g_screen == SCR_SCAN || g_screen == SCR_BLE) && !g_detail;
+      if (active) {
+        const float STEP_SIGN = 1.0f;          // flip to -1 if up/down come out reversed
+        const float STEP_DEAD = 0.12f;         // tilt (g) from the captured reference to step
+        const unsigned long FIRST_MS  = 300;   // a quick tilt returning inside this = ONE step
+        const unsigned long REPEAT_MS = 260;   // held -> ~4 entries/sec
+        if (!s_was) { s_neutral = gx; s_dir = 0; s_was = true; }   // capture fixed reference on entry
+        float e = STEP_SIGN * (gx - s_neutral);                    // stable: does NOT drift
+        int dir = (e >= STEP_DEAD) ? 1 : (e <= -STEP_DEAD) ? -1 : 0;
+        g_dbg_cur_e = e; g_dbg_cur_dir = dir;       // DEBUG readout
+        if (dir == 0) {
+          s_dir = 0;                            // back at reference — ready for the next step
+        } else {
+          unsigned long t = millis();
+          bool fire = false;
+          if (dir != s_dir)     { fire = true; s_dir = dir; s_next = t + FIRST_MS; }  // first step now
+          else if (t >= s_next) { fire = true; s_next = t + REPEAT_MS; }              // held -> steady walk
+          if (fire && g_dispN > 0) {
+            g_scan_sel += dir;
+            if (g_scan_sel < 0)        g_scan_sel = 0;
+            if (g_scan_sel >= g_dispN) g_scan_sel = g_dispN - 1;
+            strncpy(g_cursor_mac, g_disp[g_scan_sel].mac, 17);
+            g_cursor_mac[17] = '\0';
+            g_cursor_idle_ms = millis();
+          }
         }
+      } else {
+        s_was = false;                          // left cursor mode — recapture neutral next entry
       }
     }
   }
