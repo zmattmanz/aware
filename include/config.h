@@ -35,4 +35,12 @@ constexpr int   kRangeDefaultIdx  = 1;  // 10 km
 // How often to refetch ADS-B (ms). adsb.fi is a free community feed; be kind.
 constexpr unsigned long kFetchIntervalMs = 25000;
 
+// --- Audio ------------------------------------------------------------------
+// Onboard-speaker master volume, 0–255. The onboard amp is small (~1 W), so
+// this is the whole range you have on the built-in speaker.
+//   200 ≈ 78% — loud, safe on battery.
+//   255 = max — loudest, but a sustained loud tone can brown-out / reboot the
+//         Stick on battery (fine on USB). Bump to 255 if you mostly run on USB.
+constexpr uint8_t kSpeakerVolume = 200;
+
 }  // namespace appcfg

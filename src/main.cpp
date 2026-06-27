@@ -126,7 +126,6 @@ static bool          g_detail    = false;
 static bool          g_cursor_mode   = false;      // selection cursor active on feed screen
 static char          g_cursor_mac[18] = {};         // pinned entry MAC — survives feed reorder
 static unsigned long g_cursor_idle_ms = 0;          // time of last cursor gesture (8 s timeout)
-static bool          g_pitch_armed   = true;        // must re-centre before next discrete step
 static float         g_cursor_anim_y = 0.0f;        // animated highlight Y (pixels in list coords)
 
 // ---------------------------------------------------------------------------
@@ -1132,7 +1131,7 @@ static void drawFeedList(const RfRow* rows, int n, int top, int win) {
     if (tgt < 0) tgt = 0; if (tgt > maxS) tgt = maxS;
     g_feed_scroll += (tgt - g_feed_scroll) * (1.0f - expf(-dt / 55.0f));
   } else if (ticker) {                              // tilt-controlled flow, seamless wrap both ways
-    g_feed_vel_eased += (g_feed_vel - g_feed_vel_eased) * (1.0f - expf(-dt / 110.0f));  // smooth speed
+    g_feed_vel_eased += (g_feed_vel - g_feed_vel_eased) * (1.0f - expf(-dt / 55.0f));   // smooth speed (snappier)
     g_feed_scroll += g_feed_vel_eased * dt / 1000.0f;
     while (g_feed_scroll >= total) g_feed_scroll -= total;
     while (g_feed_scroll <  0.0f)  g_feed_scroll += total;
@@ -1206,7 +1205,7 @@ static void drawFeedList(const RfRow* rows, int n, int top, int win) {
 
   // ===== tilt HUD =====
   {
-    const float HUD_DEAD = 0.18f, HUD_RANGE = 0.45f;   // HUD_DEAD must match the tick's TILT_DEAD
+    const float HUD_DEAD = 0.11f, HUD_RANGE = 0.45f;   // HUD_DEAD must match the tick's TILT_DEAD
     const int   cxp = W / 2, half = 34, ty = H - 5;
 
     // (A) live hash indicator — fades in while tilting, marker rides toward the hashes
@@ -1739,7 +1738,7 @@ void setup() {
   M5.begin(cfg);
   M5.Power.setExtOutput(false);   // belt-and-suspenders: keep Hat/Grove 5V off
   M5.Speaker.begin();
-  M5.Speaker.setVolume(150);      // ~59% — clean on battery; stay <75% (200) to avoid brownout
+  M5.Speaker.setVolume(appcfg::kSpeakerVolume);   // see config.h (default 200 ≈ 78%)
   M5.Speaker.playWav(aware_boot_wav, aware_boot_wav_len);  // boot chime — non-blocking (DMA)
   g_aircraft_va.init(aircraft_wav, aircraft_wav_len, 9000);
   g_drone_va.init(drone_wav,    drone_wav_len,    9000);
@@ -1839,9 +1838,25 @@ void loop() {
     render();
   }
 
-  // BtnA long-press: from BLE/SCAN detail → enter locator; otherwise toggle pause
-  if (M5.BtnA.wasHold() && (g_screen == SCR_SCAN || g_screen == SCR_BLE || g_screen == SCR_AIRSPACE)) {
-    if ((g_screen == SCR_SCAN || g_screen == SCR_BLE) && g_detail) {
+  // BtnA long-press: feed -> FREEZE the feed + drop a cursor on the current top
+  //                  row (toggle); detail -> locate this row; airspace -> pause
+  if (M5.BtnA.wasHold()) {
+    if ((g_screen == SCR_SCAN || g_screen == SCR_BLE) && !g_detail) {
+      if (g_cursor_mode) {                         // already picking -> back to live feed
+        g_cursor_mode = false; g_feed_manual = false;
+      } else {                                     // freeze here; highlight the top row
+        g_cursor_mode = true; g_feed_manual = true; g_feed_touch = millis();
+        g_cursor_idle_ms = millis();
+        if (g_dispN > 0) {
+          if (g_scan_sel < 0) g_scan_sel = 0;
+          if (g_scan_sel >= g_dispN) g_scan_sel = g_dispN - 1;
+          strncpy(g_cursor_mac, g_disp[g_scan_sel].mac, 17); g_cursor_mac[17] = '\0';
+        }
+        g_feed_scroll   = (float)(g_scan_sel * F_ROW_H);    // snap: highlighted row at top NOW
+        g_cursor_anim_y = (float)(g_scan_sel * F_ROW_H);    // seed: no jump on entry
+      }
+      render();
+    } else if ((g_screen == SCR_SCAN || g_screen == SCR_BLE) && g_detail) {
       strncpy(g_locate_mac, g_detail_row.mac, sizeof(g_locate_mac) - 1);
       g_locate_mac[sizeof(g_locate_mac) - 1] = '\0';
       strncpy(g_locate_id,  g_detail_row.id,  sizeof(g_locate_id)  - 1);
@@ -1850,11 +1865,12 @@ void loop() {
       g_locate_last_seen_ms = millis();
       g_locate_last_beep_ms = 0;
       g_locating            = true;
-    } else {
+      render();
+    } else if (g_screen == SCR_AIRSPACE) {
       g_paused = !g_paused;
       if (!g_paused) g_detail = false;
+      render();
     }
-    render();
   }
 
   // BtnB click: feed = enter cursor / select entry; airspace = cycle; setup = portal
@@ -1884,18 +1900,8 @@ void loop() {
             g_cursor_mode = false; g_feed_manual = false;
           }
         }
-      } else {
-        // cursor inactive: B click enters cursor mode at the current top-of-viewport row
-        g_cursor_mode = true; g_feed_manual = true; g_feed_touch = millis();
-        g_cursor_idle_ms = millis(); g_pitch_armed = true;
-        if (g_dispN > 0) {
-          if (g_scan_sel < 0) g_scan_sel = 0;
-          if (g_scan_sel >= g_dispN) g_scan_sel = g_dispN - 1;
-          strncpy(g_cursor_mac, g_disp[g_scan_sel].mac, 17);
-          g_cursor_mac[17] = '\0';
-        }
-        g_cursor_anim_y = (float)(g_scan_sel * F_ROW_H);  // seed: no jump on entry
       }
+      // cursor inactive: B does nothing on the live feed — A-hold starts picking
     } else if (g_screen == SCR_AIRSPACE) {
       if (g_air_count > 0) g_airspace_sel = (g_airspace_sel + 1) % g_air_count;
     } else if (g_screen == SCR_SETUP && !g_portal_active) {
@@ -2029,7 +2035,7 @@ void loop() {
     float ax, ay, az;
     M5.Imu.update();
     M5.Imu.getAccel(&ax, &ay, &az);
-    const float k = 0.033f;   // preserves ~300 ms LP time constant at 10 ms interval
+    const float k = 0.09f;    // ~110 ms LP — snappier tilt response (was 0.033/~300 ms)
     gx += k * (ax - gx); gy += k * (ay - gy); gz += k * (az - gz);
     float h = (fabsf(gx) >= fabsf(gy)) ? gx : gy;  // dominant horizontal axis
     // auto-rotate: limit to 20 Hz — no need to check orientation on every IMU tick
@@ -2047,8 +2053,8 @@ void loop() {
     // ---- tilt-shuttle: roll axis sets feed scroll velocity ----
     {
       const float TILT_SIGN = 1.0f;     // set -1 if forward tilt scrolls the wrong way
-      const float TILT_DEAD = 0.18f;    // wider neutral band, ~11 deg
-      const float TILT_SENS = 600.0f;   // px/s per g past the deadzone
+      const float TILT_DEAD = 0.11f;    // narrower neutral band (~6 deg) — reacts to smaller tilt
+      const float TILT_SENS = 850.0f;   // px/s per g past the deadzone — more scroll per degree
       float tilt = TILT_SIGN * gx;      // LEFT-RIGHT (roll) axis = gx; if it does nothing, try gy or gz
       if (g_tilt_neutral > 90.0f) g_tilt_neutral = tilt;          // first-run seed
       if ((g_screen == SCR_SCAN || g_screen == SCR_BLE) && !g_detail && !g_paused) {
@@ -2070,25 +2076,34 @@ void loop() {
       }
     }
 
-    // ---- cursor mode: pitch-based discrete up/down (one step per gesture) ----
-    // Axis: gy (pitch, forward/back).  Flip PITCH_SIGN to -1 if up/down are reversed.
+    // ---- cursor mode: tilt to move the highlight up/down. Uses the SAME calibrated
+    //      left/right (roll) signal as scrolling — g_tilt_e is neutral-subtracted, so
+    //      it works at any hold angle. Tilt-and-hold auto-repeats; return to level to
+    //      stop. (The ticker is frozen in cursor mode, so this is unambiguous.)
     if (g_cursor_mode && (g_screen == SCR_SCAN || g_screen == SCR_BLE) && !g_detail) {
-      const float PITCH_SIGN = 1.0f;
-      const float PITCH_DEAD = 0.20f;   // same order as TILT_DEAD
-      float pitch = PITCH_SIGN * gy;
-      if (fabsf(pitch) <= PITCH_DEAD) {
-        g_pitch_armed = true;            // back in neutral — ready to fire next step
-      } else if (g_pitch_armed) {
-        int step = (pitch > 0) ? 1 : -1;
-        g_scan_sel += step;
-        if (g_scan_sel < 0)        g_scan_sel = 0;
-        if (g_scan_sel >= g_dispN) g_scan_sel = g_dispN > 0 ? g_dispN - 1 : 0;
-        if (g_scan_sel >= 0 && g_scan_sel < g_dispN) {
+      const float STEP_SIGN = 1.0f;          // flip to -1 if up/down come out reversed
+      const float STEP_DEAD = 0.12f;         // tilt past this (g, from neutral) = move
+      const unsigned long FIRST_MS  = 420;   // delay before a held tilt starts repeating
+      const unsigned long REPEAT_MS = 170;   // step interval while held
+      static unsigned long s_next = 0;
+      static int s_dir = 0;
+      float e = STEP_SIGN * g_tilt_e;
+      int dir = (e >= STEP_DEAD) ? 1 : (e <= -STEP_DEAD) ? -1 : 0;
+      if (dir == 0) {
+        s_dir = 0;                            // back to level — disarm
+      } else {
+        unsigned long t = millis();
+        bool fire = false;
+        if (dir != s_dir)      { fire = true; s_dir = dir; s_next = t + FIRST_MS; } // first step now
+        else if (t >= s_next)  { fire = true; s_next = t + REPEAT_MS; }             // held -> repeat
+        if (fire && g_dispN > 0) {
+          g_scan_sel += dir;
+          if (g_scan_sel < 0)        g_scan_sel = 0;
+          if (g_scan_sel >= g_dispN) g_scan_sel = g_dispN - 1;
           strncpy(g_cursor_mac, g_disp[g_scan_sel].mac, 17);
           g_cursor_mac[17] = '\0';
+          g_cursor_idle_ms = millis();
         }
-        g_pitch_armed    = false;        // consumed — require re-centre before next step
-        g_cursor_idle_ms = millis();
       }
     }
   }
