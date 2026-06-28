@@ -749,11 +749,12 @@ static void drawAirspaceDetail() {
   const AContact& c = g_air[g_airspace_sel];
 
   char pos[12]; snprintf(pos, sizeof(pos), "%d/%d", g_airspace_sel + 1, n);
-  drawPillHeader(c.is_drone ? "Drone" : "Aircraft", true, pos);
+  bool haveId = (c.id[0] && strncmp(c.id, "----", 4) != 0);   // ADS-B callsign / drone RID
+  drawPillHeader(haveId ? c.id : (c.is_drone ? "Drone" : "Aircraft"), true, pos);
 
+  // identifier now lives in the header pill; show the category beneath it
   fontBody(); cv.setTextDatum(top_left); cv.setTextColor(c.is_drone ? LILAC : FG, BG);
-  cv.setClipRect(8, 28, 224, 22); cv.drawString(c.id, 8, 30); cv.clearClipRect();
-  fontSmall(); cv.setTextColor(MUTE, BG); cv.drawString(c.type, 8, 52);
+  cv.setClipRect(8, 28, 224, 22); cv.drawString(c.type, 8, 34); cv.clearClipRect();
 
   auto row = [&](int ry, const char* k, const char* v) {
     drawCard(6, ry, 228, 22, CARD, false);
@@ -1971,7 +1972,7 @@ void loop() {
           size_t nac = services::adsb::aircraftCount();
           const char* ids[64];
           for (size_t i = 0; i < nac; ++i) ids[i] = L[i].callsign;
-          if (!g_locating) g_aircraft_va.check(ids, (int)nac, g_screen == SCR_AIRSPACE);
+          if (!g_locating) g_aircraft_va.check(ids, (int)nac, true);   // announce aircraft on ANY screen
         }
         if (g_screen == SCR_AIRSPACE) render();
       }
