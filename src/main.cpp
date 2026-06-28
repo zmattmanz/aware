@@ -2082,31 +2082,39 @@ void loop() {
       g_tilt_e     = 0.0f;
     }
 
-    // ---- cursor mode: TILT steps the highlight one entry per gesture (coexists with A-tap).
-    //      Fixed reference captured on entry (no drift); feed frozen; front button inert;
-    //      no idle timeout. One tilt = one step; return toward your hold position to step again.
+    // ---- cursor mode: TILT and HOLD one direction to walk the highlight that way (~3/sec);
+    //      return toward your hold position to stop. A quick tilt-and-release = one step.
+    //      Same-direction-only repeat means returning to center can't bounce it backward.
     {
       static bool  s_was     = false;
       static int   s_latch   = 0;
+      static unsigned long s_next = 0;
       static float s_neutral = 0.0f;
       bool active = g_cursor_mode && (g_screen == SCR_SCAN || g_screen == SCR_BLE) && !g_detail;
       if (active) {
         const float STEP_SIGN = 1.0f;
         const float FIRE  = 0.14f;
         const float REARM = 0.06f;
+        const unsigned long FIRST_MS  = 350;   // quick tilt-and-release = exactly one step
+        const unsigned long REPEAT_MS = 300;   // keep holding -> ~3 entries/sec
         if (!s_was) { s_neutral = gx; s_latch = 0; s_was = true; }
         float e = STEP_SIGN * (gx - s_neutral);
         g_dbg_cur_e = e; g_dbg_cur_dir = s_latch;
         if (fabsf(e) < REARM) {
-          s_latch = 0;
-        } else if (s_latch == 0 && fabsf(e) >= FIRE && g_dispN > 0) {
+          s_latch = 0;                          // centered — re-armed (and able to switch direction)
+        } else if (fabsf(e) >= FIRE && g_dispN > 0) {
           int d = (e > 0) ? 1 : -1;
-          g_scan_sel += d;
-          if (g_scan_sel < 0)        g_scan_sel = 0;
-          if (g_scan_sel >= g_dispN) g_scan_sel = g_dispN - 1;
-          strncpy(g_cursor_mac, g_disp[g_scan_sel].mac, 17);
-          g_cursor_mac[17] = '\0';
-          s_latch = d;
+          unsigned long t = millis();
+          bool fire = false;
+          if (s_latch == 0)                      { fire = true; s_latch = d; s_next = t + FIRST_MS; }
+          else if (s_latch == d && t >= s_next)  { fire = true; s_next = t + REPEAT_MS; }  // held -> walk
+          if (fire) {
+            g_scan_sel += d;
+            if (g_scan_sel < 0)        g_scan_sel = 0;
+            if (g_scan_sel >= g_dispN) g_scan_sel = g_dispN - 1;
+            strncpy(g_cursor_mac, g_disp[g_scan_sel].mac, 17);
+            g_cursor_mac[17] = '\0';
+          }
         }
       } else {
         s_was = false;
