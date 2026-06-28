@@ -127,6 +127,8 @@ static bool          g_cursor_mode   = false;      // selection cursor active on
 static char          g_cursor_mac[18] = {};         // pinned entry MAC — survives feed reorder
 static unsigned long g_cursor_idle_ms = 0;          // time of last cursor gesture (8 s timeout)
 static float         g_cursor_anim_y = 0.0f;        // animated highlight Y (pixels in list coords)
+static float         g_dbg_cur_e   = 0.0f;          // live cursor tilt deviation from captured neutral
+static int           g_dbg_cur_dir = 0;             // step latch state (0 armed, ±1 fired)
 
 // ---------------------------------------------------------------------------
 // Locator mode — BLE proximity beep (faster = closer)
@@ -142,7 +144,7 @@ static constexpr float         kLocFar          = -90.0f;  // dBm far end → sl
 static constexpr float         kLocNear         = -45.0f;  // dBm near end → solid tone
 static constexpr int           kLocSlowMs       = 1200;    // ms between beeps at far
 static constexpr int           kLocFastMs       =   60;    // ms between beeps at near
-static constexpr float         kLocAlpha        =  0.30f;  // EMA smoothing factor
+static constexpr float         kLocAlpha        =  0.40f;  // EMA smoothing (snappier)
 static constexpr unsigned long kLocLostMs       = 2500;    // ms without sighting = signal lost
 static constexpr uint16_t      kLocFreq         = 2700;    // Hz — cutting but not shrill
 static constexpr int           kLocDurMs        =   35;    // ms per locator beep
@@ -1249,9 +1251,12 @@ static void drawFeedList(const RfRow* rows, int n, int top, int win) {
     cv.setTextColor(MUTE, PILL_BG); cv.setTextDatum(middle_center);
     cv.drawString(pi, W - 6 - pw / 2, top + 12);
 
-    // in-pick controls hint
+    // in-pick hint + live tilt readout
     fontSmall(); cv.setTextColor(MUTE, BG); cv.setTextDatum(bottom_left);
-    cv.drawString("A next   B pick", 6, H - 2);
+    cv.drawString("tilt/A move  B pick", 6, H - 2);
+    char rd[20]; snprintf(rd, sizeof(rd), "e%+.2f d%+d", g_dbg_cur_e, g_dbg_cur_dir);
+    cv.setTextColor(rgb565(0x66,0xCC,0x66), BG); cv.setTextDatum(bottom_right);
+    cv.drawString(rd, W - 6, H - 2);
   }
 }
 
@@ -1638,44 +1643,69 @@ static void locatorBeep(uint16_t freq_hz, int dur_ms) {
 static void drawLocateScreen() {
   unsigned long now = millis();
   bool lost = (g_locate_last_seen_ms == 0 || now - g_locate_last_seen_ms > kLocLostMs);
+  auto lerpc = [](uint16_t a, uint16_t b, float t) -> uint16_t {
+    if (t < 0) t = 0; if (t > 1) t = 1;
+    int ar=(a>>11)&0x1F, ag=(a>>5)&0x3F, ab=a&0x1F;
+    int br=(b>>11)&0x1F, bg=(b>>5)&0x3F, bb=b&0x1F;
+    return ((uint16_t)(ar+(int)((br-ar)*t))<<11) |
+           ((uint16_t)(ag+(int)((bg-ag)*t))<<5)  |
+            (uint16_t)(ab+(int)((bb-ab)*t));
+  };
 
   drawTopBar("LOCATE");
   drawBottomBar("A: exit", "", "");
 
-  // Target label
-  fontBody();
-  cv.setTextDatum(middle_center);
-  cv.setTextColor(FG, BG);
-  cv.drawString(g_locate_id[0] ? g_locate_id : g_locate_mac, W / 2, CONTENT_Y + 16);
+  // target label
+  fontBody(); cv.setTextDatum(middle_center); cv.setTextColor(FG, BG);
+  cv.drawString(g_locate_id[0] ? g_locate_id : g_locate_mac, W / 2, CONTENT_Y + 9);
+
+  // eased proximity 0..1 (far..near) — animates smoothly toward the live reading
+  static float s_prox = 0.0f;
+  float rssi_c = (g_rssi_smooth < kLocFar) ? kLocFar : (g_rssi_smooth > kLocNear ? kLocNear : g_rssi_smooth);
+  float prox_t = lost ? 0.0f : (rssi_c - kLocFar) / (kLocNear - kLocFar);
+  s_prox += (prox_t - s_prox) * 0.18f;
+
+  const int cx = 64, cy = CONTENT_Y + 56, maxR = 30;
+  uint16_t glow = lerpc(rgb565(0x2A,0x4A,0x7A), COL_OK, s_prox);   // blue (far) -> green (near)
 
   if (lost) {
-    fontSmall();
-    cv.setTextColor(COL_BAD, BG);
-    cv.drawString("SIGNAL LOST", W / 2, CONTENT_Y + 40);
+    float ph = (now % 1800) / 1800.0f;                              // lone slow searching sweep
+    cv.drawCircle(cx, cy, (int)(ph * maxR), lerpc(BG, rgb565(0x70,0x30,0x30), 1.0f - ph));
+    cv.fillSmoothCircle(cx, cy, 3, rgb565(0x70,0x30,0x30));
   } else {
-    // RSSI value
-    char buf[16]; snprintf(buf, sizeof(buf), "%d dBm", (int)g_rssi_smooth);
-    fontSmall();
-    cv.setTextColor(MUTE, BG);
-    cv.drawString(buf, W / 2, CONTENT_Y + 40);
-
-    // Distance hint
-    const char* hint; uint16_t hcol;
-    if      (g_rssi_smooth >= kLocNear)        { hint = "NEAR";    hcol = COL_OK;   }
-    else if (g_rssi_smooth >= -65.0f)           { hint = "CLOSE";   hcol = LILAC;    }
-    else if (g_rssi_smooth >= kLocFar + 25.0f)  { hint = "FAR";     hcol = COL_HEAD; }
-    else                                         { hint = "DISTANT"; hcol = MUTE;     }
-    fontBody();
-    cv.setTextColor(hcol, BG);
-    cv.drawString(hint, W / 2, CONTENT_Y + 60);
-
-    // RSSI bar
-    float rssi_c = (g_rssi_smooth < kLocFar) ? kLocFar : (g_rssi_smooth > kLocNear ? kLocNear : g_rssi_smooth);
-    float frac   = (rssi_c - kLocFar) / (kLocNear - kLocFar);
-    int   bx = 20, by = CONTENT_Y + 78, bw = W - 40, bh = 8;
-    cv.fillRect(bx, by, bw, bh, CARD);
-    cv.fillRect(bx, by, (int)(frac * bw), bh, hcol);
+    float speed = 0.45f + s_prox * 1.7f;                            // rings spawn faster as you close in
+    for (int k = 0; k < 3; ++k) {
+      float ph   = fmodf((now / 1000.0f) * speed + (float)k / 3.0f, 1.0f);
+      float fade = 1.0f - ph;
+      cv.drawCircle(cx, cy, (int)(ph * maxR), lerpc(BG, glow, fade * fade));
+    }
+    unsigned long sinceBeep = now - g_locate_last_beep_ms;          // bright flash synced to each beep
+    if (sinceBeep < 110) cv.drawCircle(cx, cy, maxR / 2, lerpc(BG, FG, 1.0f - sinceBeep / 110.0f));
+    int dotR = 4 + (int)(s_prox * 7.0f) + (int)(1.5f * sinf(now / 110.0f));   // pulsing target
+    cv.fillSmoothCircle(cx, cy, dotR, glow);
   }
+
+  // distance word + RSSI on the right
+  const char* hint; uint16_t hcol;
+  if      (g_rssi_smooth >= kLocNear)       { hint = "NEAR";    hcol = COL_OK;   }
+  else if (g_rssi_smooth >= -65.0f)          { hint = "CLOSE";   hcol = LILAC;    }
+  else if (g_rssi_smooth >= kLocFar + 25.0f) { hint = "FAR";     hcol = COL_HEAD; }
+  else                                        { hint = "DISTANT"; hcol = MUTE;     }
+  if (lost) { hint = "SEARCHING"; hcol = COL_BAD; }
+
+  const int tx = 162;
+  fontBody(); cv.setTextDatum(middle_center); cv.setTextColor(hcol, BG);
+  cv.drawString(hint, tx, cy - 8);
+  char buf[16];
+  if (lost) snprintf(buf, sizeof(buf), "-- dBm");
+  else      snprintf(buf, sizeof(buf), "%d dBm", (int)g_rssi_smooth);
+  fontSmall(); cv.setTextColor(MUTE, BG);
+  cv.drawString(buf, tx, cy + 14);
+
+  // eased proximity bar
+  int bx = 20, by = CONTENT_Y + 92, bw = W - 40, bh = 6;
+  cv.fillSmoothRoundRect(bx, by, bw, bh, 3, CARD);
+  if (!lost) cv.fillSmoothRoundRect(bx, by, (int)(s_prox * bw), bh, 3, hcol);
 }
 
 static void render() {
@@ -1981,8 +2011,8 @@ void loop() {
 
   // Locator mode: poll BLE table for target RSSI and drive the beep engine
   if (g_locating) {
-    static unsigned long s_loc_poll = 0;
-    if (now - s_loc_poll >= 100) {
+    static unsigned long s_loc_poll = 0, s_loc_draw = 0;
+    if (now - s_loc_poll >= 50) {                 // poll target RSSI at 20 Hz
       s_loc_poll = now;
       drone::BleSight bl[24]; int nb = (int)drone::bleSnapshot(bl, 24);
       for (int i = 0; i < nb; ++i) {
@@ -1992,8 +2022,8 @@ void loop() {
           break;
         }
       }
-      render();
     }
+    if (now - s_loc_draw >= 33) { s_loc_draw = now; render(); }   // 30 Hz sonar animation
     bool lost = (now - g_locate_last_seen_ms > kLocLostMs);
     if (lost) {
       if (now - g_locate_last_beep_ms >= kLocSearchPeriod) {
@@ -2052,9 +2082,36 @@ void loop() {
       g_tilt_e     = 0.0f;
     }
 
-    // ---- cursor mode picking is BUTTON-DRIVEN now (no tilt): A-click advances the
-    //      highlight, B-click selects, B-hold exits. See the button handlers above.
-    //      Tilt is no longer involved in selection at all.
+    // ---- cursor mode: TILT steps the highlight one entry per gesture (coexists with A-tap).
+    //      Fixed reference captured on entry (no drift); feed frozen; front button inert;
+    //      no idle timeout. One tilt = one step; return toward your hold position to step again.
+    {
+      static bool  s_was     = false;
+      static int   s_latch   = 0;
+      static float s_neutral = 0.0f;
+      bool active = g_cursor_mode && (g_screen == SCR_SCAN || g_screen == SCR_BLE) && !g_detail;
+      if (active) {
+        const float STEP_SIGN = 1.0f;
+        const float FIRE  = 0.14f;
+        const float REARM = 0.06f;
+        if (!s_was) { s_neutral = gx; s_latch = 0; s_was = true; }
+        float e = STEP_SIGN * (gx - s_neutral);
+        g_dbg_cur_e = e; g_dbg_cur_dir = s_latch;
+        if (fabsf(e) < REARM) {
+          s_latch = 0;
+        } else if (s_latch == 0 && fabsf(e) >= FIRE && g_dispN > 0) {
+          int d = (e > 0) ? 1 : -1;
+          g_scan_sel += d;
+          if (g_scan_sel < 0)        g_scan_sel = 0;
+          if (g_scan_sel >= g_dispN) g_scan_sel = g_dispN - 1;
+          strncpy(g_cursor_mac, g_disp[g_scan_sel].mac, 17);
+          g_cursor_mac[17] = '\0';
+          s_latch = d;
+        }
+      } else {
+        s_was = false;
+      }
+    }
   }
 
   static unsigned long last_batt = 0;

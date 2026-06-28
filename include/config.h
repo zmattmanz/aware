@@ -41,6 +41,6 @@ constexpr unsigned long kFetchIntervalMs = 25000;
 //   200 ≈ 78% — loud, safe on battery.
 //   255 = max — loudest, but a sustained loud tone can brown-out / reboot the
 //         Stick on battery (fine on USB). Bump to 255 if you mostly run on USB.
-constexpr uint8_t kSpeakerVolume = 200;
+constexpr uint8_t kSpeakerVolume = 135;
 
 }  // namespace appcfg

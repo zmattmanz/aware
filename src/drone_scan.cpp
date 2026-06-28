@@ -148,8 +148,8 @@ void begin() {
   s_scan = NimBLEDevice::getScan();
   s_scan->setScanCallbacks(&s_cb, true);   // report every advert so last_seen refreshes and ODID multi-packet builds up
   s_scan->setActiveScan(false);  // Remote ID lives in the advertisement; no scan-response needed
-  s_scan->setInterval(320);      // 0.625 ms units -> 200 ms period
-  s_scan->setWindow(60);         // listen 37.5 ms per period (~19% duty cycle)
+  s_scan->setInterval(160);      // 0.625 ms units -> 100 ms period (faster catch-rate)
+  s_scan->setWindow(96);         // listen 60 ms per period (~60% duty) — snappy locator
   s_scan->start(0, false);       // 0 = scan forever
 }
 
