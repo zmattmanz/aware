@@ -1179,20 +1179,23 @@ static void drawFeedList(const RfRow* rows, int n, int top, int win) {
     }
     if (topIdx >= 0) g_scan_sel = topIdx;            // drill target = the row currently at the top
   } else {
-    // highlight slides toward the selected entry (animated glide); snap in non-cursor manual
+    // smooth glide: the highlighted card rides the eased pixel position and slides over the
+    // static neighbours, instead of the selection snapping from one row to the next.
     float anim_target = (float)(g_scan_sel * ROW);
     if (g_cursor_mode)
-      g_cursor_anim_y += (anim_target - g_cursor_anim_y) * (1.0f - expf(-dt / 70.0f));
+      g_cursor_anim_y += (anim_target - g_cursor_anim_y) * (1.0f - expf(-dt / 85.0f));
     else
       g_cursor_anim_y = anim_target;
-    int anim_sel = (int)lroundf(g_cursor_anim_y / ROW);
-    if (anim_sel < 0) anim_sel = 0;
-    if (anim_sel >= n) anim_sel = n - 1;
 
     for (int i = 0; i < n; ++i) {
+      if (g_feed_manual && i == g_scan_sel) continue;       // drawn last, as the sliding highlight
       int y = top + i * ROW - sInt;
       if (y + ROW <= top || y >= top + win) continue;
-      row(rows[i], y, (g_feed_manual && i == anim_sel));
+      row(rows[i], y, false);
+    }
+    if (g_feed_manual && g_scan_sel >= 0 && g_scan_sel < n) {
+      int hy = top + (int)lroundf(g_cursor_anim_y) - sInt;
+      if (hy + ROW > top && hy < top + win) row(rows[g_scan_sel], hy, true);
     }
   }
   cv.clearClipRect();
@@ -1206,34 +1209,40 @@ static void drawFeedList(const RfRow* rows, int n, int top, int win) {
 
   // ===== tilt HUD =====
   {
-    const float HUD_DEAD = 0.11f, HUD_RANGE = 0.45f;   // HUD_DEAD must match the tick's TILT_DEAD
-    const int   cxp = W / 2, half = 34, ty = H - 5;
+    // In cursor mode this rides your PICK tilt (g_dbg_cur_e); the side hashes mark the
+    // step point (FIRE). Outside cursor mode it stays idle (tilt no longer scrolls the feed).
+    const bool   cur      = g_cursor_mode;
+    const float  te       = cur ? g_dbg_cur_e : g_tilt_e;
+    const float  HUD_DEAD = cur ? 0.14f : 0.11f;       // FIRE threshold while picking
+    const float  HUD_RANGE= cur ? 0.26f : 0.45f;
+    const int    cxp = W / 2, half = 34, ty = H - 5;
 
-    // (A) live hash indicator — fades in while tilting, marker rides toward the hashes
+    // live hash indicator — shows while picking (or tilting); marker rides toward the hashes
     static float s_hud = 0.0f;
-    float tgt = (fabsf(g_tilt_e) > 0.05f) ? 1.0f : 0.0f;
+    float tgt = (cur || fabsf(te) > 0.05f) ? 1.0f : 0.0f;
     s_hud += (tgt - s_hud) * 0.20f;
     if (s_hud > 0.02f) {
       uint16_t base = lerp565(BG, rgb565(0x6A,0x6A,0x78), s_hud);
       uint16_t hot  = lerp565(BG, rgb565(0xF4,0xF4,0xF7), s_hud);
       cv.drawFastHLine(cxp - half, ty, half * 2, base);
-      int dz = (int)(half * (HUD_DEAD / HUD_RANGE));     // deadzone-edge "scroll starts here" hashes
+      int dz = (int)(half * (HUD_DEAD / HUD_RANGE));   // hashes = where a step fires
       cv.drawFastVLine(cxp - dz, ty - 3, 6, base);
       cv.drawFastVLine(cxp + dz, ty - 3, 6, base);
-      cv.drawFastVLine(cxp,      ty - 2, 4, base);        // center (neutral) tick
-      float pe = g_tilt_e / HUD_RANGE; if (pe > 1) pe = 1; if (pe < -1) pe = -1;
+      cv.drawFastVLine(cxp,      ty - 2, 4, base);      // center (neutral) tick
+      float pe = te / HUD_RANGE; if (pe > 1) pe = 1; if (pe < -1) pe = -1;
       int  mx   = cxp + (int)(pe * half);
-      bool past = fabsf(g_tilt_e) > HUD_DEAD;
-      cv.fillSmoothCircle(mx, ty, past ? 3 : 2, past ? hot : base);
+      bool past = fabsf(te) > HUD_DEAD;
+      uint16_t mc = past ? lerp565(BG, COL_OK, s_hud) : hot;   // greens as you cross the step point
+      cv.fillSmoothCircle(mx, ty, past ? 4 : 2, mc);
     }
 
     // (B) entry hint — "hold A to pick", after the name toast
-    unsigned long te = millis() - g_screen_since;
+    unsigned long telapsed = millis() - g_screen_since;
     float hop = 0.0f;
-    if      (te < 1300) hop = 0.0f;
-    else if (te < 1600) hop = (te - 1300) / 300.0f;
-    else if (te < 2700) hop = 1.0f;
-    else if (te < 3100) hop = 1.0f - (te - 2700) / 400.0f;
+    if      (telapsed < 1300) hop = 0.0f;
+    else if (telapsed < 1600) hop = (telapsed - 1300) / 300.0f;
+    else if (telapsed < 2700) hop = 1.0f;
+    else if (telapsed < 3100) hop = 1.0f - (telapsed - 2700) / 400.0f;
     if (hop > 0.02f) {
       uint16_t hc = lerp565(BG, rgb565(0xF4,0xF4,0xF7), hop * 0.9f);
       int hx = W / 2, hy = H - 18;
@@ -1242,21 +1251,11 @@ static void drawFeedList(const RfRow* rows, int n, int top, int win) {
     }
   }
 
-  // position counter: "4/17" pill in the top-right of the feed window during cursor mode
+  // in-pick hint (the top-right counter pill was removed — it covered the top entry's
+  // signal; the tilt meter at the bottom now gives the live pick feedback)
   if (g_cursor_mode && n > 0) {
-    char pi[12]; snprintf(pi, sizeof(pi), "%d/%d", g_scan_sel + 1, n);
-    fontSmall();
-    int pw = cv.textWidth(pi) + 12;
-    cv.fillSmoothRoundRect(W - 6 - pw, top + 4, pw, 15, 7, PILL_BG);
-    cv.setTextColor(MUTE, PILL_BG); cv.setTextDatum(middle_center);
-    cv.drawString(pi, W - 6 - pw / 2, top + 12);
-
-    // in-pick hint + live tilt readout
     fontSmall(); cv.setTextColor(MUTE, BG); cv.setTextDatum(bottom_left);
-    cv.drawString("tilt/A move  B pick", 6, H - 2);
-    char rd[20]; snprintf(rd, sizeof(rd), "e%+.2f d%+d", g_dbg_cur_e, g_dbg_cur_dir);
-    cv.setTextColor(rgb565(0x66,0xCC,0x66), BG); cv.setTextDatum(bottom_right);
-    cv.drawString(rd, W - 6, H - 2);
+    cv.drawString("B pick", 6, H - 4);
   }
 }
 

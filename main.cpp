@@ -127,6 +127,8 @@ static bool          g_cursor_mode   = false;      // selection cursor active on
 static char          g_cursor_mac[18] = {};         // pinned entry MAC — survives feed reorder
 static unsigned long g_cursor_idle_ms = 0;          // time of last cursor gesture (8 s timeout)
 static float         g_cursor_anim_y = 0.0f;        // animated highlight Y (pixels in list coords)
+static float         g_dbg_cur_e   = 0.0f;          // live cursor tilt deviation from captured neutral
+static int           g_dbg_cur_dir = 0;             // step latch state (0 armed, ±1 fired)
 
 // ---------------------------------------------------------------------------
 // Locator mode — BLE proximity beep (faster = closer)
@@ -142,7 +144,7 @@ static constexpr float         kLocFar          = -90.0f;  // dBm far end → sl
 static constexpr float         kLocNear         = -45.0f;  // dBm near end → solid tone
 static constexpr int           kLocSlowMs       = 1200;    // ms between beeps at far
 static constexpr int           kLocFastMs       =   60;    // ms between beeps at near
-static constexpr float         kLocAlpha        =  0.30f;  // EMA smoothing factor
+static constexpr float         kLocAlpha        =  0.40f;  // EMA smoothing (snappier)
 static constexpr unsigned long kLocLostMs       = 2500;    // ms without sighting = signal lost
 static constexpr uint16_t      kLocFreq         = 2700;    // Hz — cutting but not shrill
 static constexpr int           kLocDurMs        =   35;    // ms per locator beep
@@ -1177,20 +1179,23 @@ static void drawFeedList(const RfRow* rows, int n, int top, int win) {
     }
     if (topIdx >= 0) g_scan_sel = topIdx;            // drill target = the row currently at the top
   } else {
-    // highlight slides toward the selected entry (animated glide); snap in non-cursor manual
+    // smooth glide: the highlighted card rides the eased pixel position and slides over the
+    // static neighbours, instead of the selection snapping from one row to the next.
     float anim_target = (float)(g_scan_sel * ROW);
     if (g_cursor_mode)
-      g_cursor_anim_y += (anim_target - g_cursor_anim_y) * (1.0f - expf(-dt / 70.0f));
+      g_cursor_anim_y += (anim_target - g_cursor_anim_y) * (1.0f - expf(-dt / 85.0f));
     else
       g_cursor_anim_y = anim_target;
-    int anim_sel = (int)lroundf(g_cursor_anim_y / ROW);
-    if (anim_sel < 0) anim_sel = 0;
-    if (anim_sel >= n) anim_sel = n - 1;
 
     for (int i = 0; i < n; ++i) {
+      if (g_feed_manual && i == g_scan_sel) continue;       // drawn last, as the sliding highlight
       int y = top + i * ROW - sInt;
       if (y + ROW <= top || y >= top + win) continue;
-      row(rows[i], y, (g_feed_manual && i == anim_sel));
+      row(rows[i], y, false);
+    }
+    if (g_feed_manual && g_scan_sel >= 0 && g_scan_sel < n) {
+      int hy = top + (int)lroundf(g_cursor_anim_y) - sInt;
+      if (hy + ROW > top && hy < top + win) row(rows[g_scan_sel], hy, true);
     }
   }
   cv.clearClipRect();
@@ -1204,25 +1209,31 @@ static void drawFeedList(const RfRow* rows, int n, int top, int win) {
 
   // ===== tilt HUD =====
   {
-    const float HUD_DEAD = 0.11f, HUD_RANGE = 0.45f;   // HUD_DEAD must match the tick's TILT_DEAD
-    const int   cxp = W / 2, half = 34, ty = H - 5;
+    // In cursor mode this rides your PICK tilt (g_dbg_cur_e); the side hashes mark the
+    // step point (FIRE). Outside cursor mode it stays idle (tilt no longer scrolls the feed).
+    const bool   cur      = g_cursor_mode;
+    const float  te       = cur ? g_dbg_cur_e : g_tilt_e;
+    const float  HUD_DEAD = cur ? 0.14f : 0.11f;       // FIRE threshold while picking
+    const float  HUD_RANGE= cur ? 0.26f : 0.45f;
+    const int    cxp = W / 2, half = 34, ty = H - 5;
 
-    // (A) live hash indicator — fades in while tilting, marker rides toward the hashes
+    // live hash indicator — shows while picking (or tilting); marker rides toward the hashes
     static float s_hud = 0.0f;
-    float tgt = (fabsf(g_tilt_e) > 0.05f) ? 1.0f : 0.0f;
+    float tgt = (cur || fabsf(te) > 0.05f) ? 1.0f : 0.0f;
     s_hud += (tgt - s_hud) * 0.20f;
     if (s_hud > 0.02f) {
       uint16_t base = lerp565(BG, rgb565(0x6A,0x6A,0x78), s_hud);
       uint16_t hot  = lerp565(BG, rgb565(0xF4,0xF4,0xF7), s_hud);
       cv.drawFastHLine(cxp - half, ty, half * 2, base);
-      int dz = (int)(half * (HUD_DEAD / HUD_RANGE));     // deadzone-edge "scroll starts here" hashes
+      int dz = (int)(half * (HUD_DEAD / HUD_RANGE));   // hashes = where a step fires
       cv.drawFastVLine(cxp - dz, ty - 3, 6, base);
       cv.drawFastVLine(cxp + dz, ty - 3, 6, base);
-      cv.drawFastVLine(cxp,      ty - 2, 4, base);        // center (neutral) tick
-      float pe = g_tilt_e / HUD_RANGE; if (pe > 1) pe = 1; if (pe < -1) pe = -1;
+      cv.drawFastVLine(cxp,      ty - 2, 4, base);      // center (neutral) tick
+      float pe = te / HUD_RANGE; if (pe > 1) pe = 1; if (pe < -1) pe = -1;
       int  mx   = cxp + (int)(pe * half);
-      bool past = fabsf(g_tilt_e) > HUD_DEAD;
-      cv.fillSmoothCircle(mx, ty, past ? 3 : 2, past ? hot : base);
+      bool past = fabsf(te) > HUD_DEAD;
+      uint16_t mc = past ? lerp565(BG, COL_OK, s_hud) : hot;   // greens as you cross the step point
+      cv.fillSmoothCircle(mx, ty, past ? 4 : 2, mc);
     }
 
     // (B) entry hint — "hold A to pick", after the name toast
@@ -1240,18 +1251,11 @@ static void drawFeedList(const RfRow* rows, int n, int top, int win) {
     }
   }
 
-  // position counter: "4/17" pill in the top-right of the feed window during cursor mode
+  // in-pick hint (the top-right counter pill was removed — it covered the top entry's
+  // signal; the tilt meter at the bottom now gives the live pick feedback)
   if (g_cursor_mode && n > 0) {
-    char pi[12]; snprintf(pi, sizeof(pi), "%d/%d", g_scan_sel + 1, n);
-    fontSmall();
-    int pw = cv.textWidth(pi) + 12;
-    cv.fillSmoothRoundRect(W - 6 - pw, top + 4, pw, 15, 7, PILL_BG);
-    cv.setTextColor(MUTE, PILL_BG); cv.setTextDatum(middle_center);
-    cv.drawString(pi, W - 6 - pw / 2, top + 12);
-
-    // in-pick controls hint
     fontSmall(); cv.setTextColor(MUTE, BG); cv.setTextDatum(bottom_left);
-    cv.drawString("A next   B pick", 6, H - 2);
+    cv.drawString("B pick", 6, H - 4);
   }
 }
 
@@ -1638,44 +1642,69 @@ static void locatorBeep(uint16_t freq_hz, int dur_ms) {
 static void drawLocateScreen() {
   unsigned long now = millis();
   bool lost = (g_locate_last_seen_ms == 0 || now - g_locate_last_seen_ms > kLocLostMs);
+  auto lerpc = [](uint16_t a, uint16_t b, float t) -> uint16_t {
+    if (t < 0) t = 0; if (t > 1) t = 1;
+    int ar=(a>>11)&0x1F, ag=(a>>5)&0x3F, ab=a&0x1F;
+    int br=(b>>11)&0x1F, bg=(b>>5)&0x3F, bb=b&0x1F;
+    return ((uint16_t)(ar+(int)((br-ar)*t))<<11) |
+           ((uint16_t)(ag+(int)((bg-ag)*t))<<5)  |
+            (uint16_t)(ab+(int)((bb-ab)*t));
+  };
 
   drawTopBar("LOCATE");
   drawBottomBar("A: exit", "", "");
 
-  // Target label
-  fontBody();
-  cv.setTextDatum(middle_center);
-  cv.setTextColor(FG, BG);
-  cv.drawString(g_locate_id[0] ? g_locate_id : g_locate_mac, W / 2, CONTENT_Y + 16);
+  // target label
+  fontBody(); cv.setTextDatum(middle_center); cv.setTextColor(FG, BG);
+  cv.drawString(g_locate_id[0] ? g_locate_id : g_locate_mac, W / 2, CONTENT_Y + 9);
+
+  // eased proximity 0..1 (far..near) — animates smoothly toward the live reading
+  static float s_prox = 0.0f;
+  float rssi_c = (g_rssi_smooth < kLocFar) ? kLocFar : (g_rssi_smooth > kLocNear ? kLocNear : g_rssi_smooth);
+  float prox_t = lost ? 0.0f : (rssi_c - kLocFar) / (kLocNear - kLocFar);
+  s_prox += (prox_t - s_prox) * 0.18f;
+
+  const int cx = 64, cy = CONTENT_Y + 56, maxR = 30;
+  uint16_t glow = lerpc(rgb565(0x2A,0x4A,0x7A), COL_OK, s_prox);   // blue (far) -> green (near)
 
   if (lost) {
-    fontSmall();
-    cv.setTextColor(COL_BAD, BG);
-    cv.drawString("SIGNAL LOST", W / 2, CONTENT_Y + 40);
+    float ph = (now % 1800) / 1800.0f;                              // lone slow searching sweep
+    cv.drawCircle(cx, cy, (int)(ph * maxR), lerpc(BG, rgb565(0x70,0x30,0x30), 1.0f - ph));
+    cv.fillSmoothCircle(cx, cy, 3, rgb565(0x70,0x30,0x30));
   } else {
-    // RSSI value
-    char buf[16]; snprintf(buf, sizeof(buf), "%d dBm", (int)g_rssi_smooth);
-    fontSmall();
-    cv.setTextColor(MUTE, BG);
-    cv.drawString(buf, W / 2, CONTENT_Y + 40);
-
-    // Distance hint
-    const char* hint; uint16_t hcol;
-    if      (g_rssi_smooth >= kLocNear)        { hint = "NEAR";    hcol = COL_OK;   }
-    else if (g_rssi_smooth >= -65.0f)           { hint = "CLOSE";   hcol = LILAC;    }
-    else if (g_rssi_smooth >= kLocFar + 25.0f)  { hint = "FAR";     hcol = COL_HEAD; }
-    else                                         { hint = "DISTANT"; hcol = MUTE;     }
-    fontBody();
-    cv.setTextColor(hcol, BG);
-    cv.drawString(hint, W / 2, CONTENT_Y + 60);
-
-    // RSSI bar
-    float rssi_c = (g_rssi_smooth < kLocFar) ? kLocFar : (g_rssi_smooth > kLocNear ? kLocNear : g_rssi_smooth);
-    float frac   = (rssi_c - kLocFar) / (kLocNear - kLocFar);
-    int   bx = 20, by = CONTENT_Y + 78, bw = W - 40, bh = 8;
-    cv.fillRect(bx, by, bw, bh, CARD);
-    cv.fillRect(bx, by, (int)(frac * bw), bh, hcol);
+    float speed = 0.45f + s_prox * 1.7f;                            // rings spawn faster as you close in
+    for (int k = 0; k < 3; ++k) {
+      float ph   = fmodf((now / 1000.0f) * speed + (float)k / 3.0f, 1.0f);
+      float fade = 1.0f - ph;
+      cv.drawCircle(cx, cy, (int)(ph * maxR), lerpc(BG, glow, fade * fade));
+    }
+    unsigned long sinceBeep = now - g_locate_last_beep_ms;          // bright flash synced to each beep
+    if (sinceBeep < 110) cv.drawCircle(cx, cy, maxR / 2, lerpc(BG, FG, 1.0f - sinceBeep / 110.0f));
+    int dotR = 4 + (int)(s_prox * 7.0f) + (int)(1.5f * sinf(now / 110.0f));   // pulsing target
+    cv.fillSmoothCircle(cx, cy, dotR, glow);
   }
+
+  // distance word + RSSI on the right
+  const char* hint; uint16_t hcol;
+  if      (g_rssi_smooth >= kLocNear)       { hint = "NEAR";    hcol = COL_OK;   }
+  else if (g_rssi_smooth >= -65.0f)          { hint = "CLOSE";   hcol = LILAC;    }
+  else if (g_rssi_smooth >= kLocFar + 25.0f) { hint = "FAR";     hcol = COL_HEAD; }
+  else                                        { hint = "DISTANT"; hcol = MUTE;     }
+  if (lost) { hint = "SEARCHING"; hcol = COL_BAD; }
+
+  const int tx = 162;
+  fontBody(); cv.setTextDatum(middle_center); cv.setTextColor(hcol, BG);
+  cv.drawString(hint, tx, cy - 8);
+  char buf[16];
+  if (lost) snprintf(buf, sizeof(buf), "-- dBm");
+  else      snprintf(buf, sizeof(buf), "%d dBm", (int)g_rssi_smooth);
+  fontSmall(); cv.setTextColor(MUTE, BG);
+  cv.drawString(buf, tx, cy + 14);
+
+  // eased proximity bar
+  int bx = 20, by = CONTENT_Y + 92, bw = W - 40, bh = 6;
+  cv.fillSmoothRoundRect(bx, by, bw, bh, 3, CARD);
+  if (!lost) cv.fillSmoothRoundRect(bx, by, (int)(s_prox * bw), bh, 3, hcol);
 }
 
 static void render() {
@@ -1981,8 +2010,8 @@ void loop() {
 
   // Locator mode: poll BLE table for target RSSI and drive the beep engine
   if (g_locating) {
-    static unsigned long s_loc_poll = 0;
-    if (now - s_loc_poll >= 100) {
+    static unsigned long s_loc_poll = 0, s_loc_draw = 0;
+    if (now - s_loc_poll >= 50) {                 // poll target RSSI at 20 Hz
       s_loc_poll = now;
       drone::BleSight bl[24]; int nb = (int)drone::bleSnapshot(bl, 24);
       for (int i = 0; i < nb; ++i) {
@@ -1992,8 +2021,8 @@ void loop() {
           break;
         }
       }
-      render();
     }
+    if (now - s_loc_draw >= 33) { s_loc_draw = now; render(); }   // 30 Hz sonar animation
     bool lost = (now - g_locate_last_seen_ms > kLocLostMs);
     if (lost) {
       if (now - g_locate_last_beep_ms >= kLocSearchPeriod) {
@@ -2052,9 +2081,44 @@ void loop() {
       g_tilt_e     = 0.0f;
     }
 
-    // ---- cursor mode picking is BUTTON-DRIVEN now (no tilt): A-click advances the
-    //      highlight, B-click selects, B-hold exits. See the button handlers above.
-    //      Tilt is no longer involved in selection at all.
+    // ---- cursor mode: TILT and HOLD one direction to walk the highlight that way (~3/sec);
+    //      return toward your hold position to stop. A quick tilt-and-release = one step.
+    //      Same-direction-only repeat means returning to center can't bounce it backward.
+    {
+      static bool  s_was     = false;
+      static int   s_latch   = 0;
+      static unsigned long s_next = 0;
+      static float s_neutral = 0.0f;
+      bool active = g_cursor_mode && (g_screen == SCR_SCAN || g_screen == SCR_BLE) && !g_detail;
+      if (active) {
+        const float STEP_SIGN = 1.0f;
+        const float FIRE  = 0.14f;
+        const float REARM = 0.06f;
+        const unsigned long FIRST_MS  = 350;   // quick tilt-and-release = exactly one step
+        const unsigned long REPEAT_MS = 300;   // keep holding -> ~3 entries/sec
+        if (!s_was) { s_neutral = gx; s_latch = 0; s_was = true; }
+        float e = STEP_SIGN * (gx - s_neutral);
+        g_dbg_cur_e = e; g_dbg_cur_dir = s_latch;
+        if (fabsf(e) < REARM) {
+          s_latch = 0;                          // centered — re-armed (and able to switch direction)
+        } else if (fabsf(e) >= FIRE && g_dispN > 0) {
+          int d = (e > 0) ? 1 : -1;
+          unsigned long t = millis();
+          bool fire = false;
+          if (s_latch == 0)                      { fire = true; s_latch = d; s_next = t + FIRST_MS; }
+          else if (s_latch == d && t >= s_next)  { fire = true; s_next = t + REPEAT_MS; }  // held -> walk
+          if (fire) {
+            g_scan_sel += d;
+            if (g_scan_sel < 0)        g_scan_sel = 0;
+            if (g_scan_sel >= g_dispN) g_scan_sel = g_dispN - 1;
+            strncpy(g_cursor_mac, g_disp[g_scan_sel].mac, 17);
+            g_cursor_mac[17] = '\0';
+          }
+        }
+      } else {
+        s_was = false;
+      }
+    }
   }
 
   static unsigned long last_batt = 0;
