@@ -127,8 +127,6 @@ static bool          g_cursor_mode   = false;      // selection cursor active on
 static char          g_cursor_mac[18] = {};         // pinned entry MAC — survives feed reorder
 static unsigned long g_cursor_idle_ms = 0;          // time of last cursor gesture (8 s timeout)
 static float         g_cursor_anim_y = 0.0f;        // animated highlight Y (pixels in list coords)
-static float         g_dbg_cur_e   = 0.0f;          // DEBUG: cursor tilt deviation from captured neutral
-static int           g_dbg_cur_dir = 0;             // DEBUG: -1/0/+1 step direction
 
 // ---------------------------------------------------------------------------
 // Locator mode — BLE proximity beep (faster = closer)
@@ -1227,7 +1225,7 @@ static void drawFeedList(const RfRow* rows, int n, int top, int win) {
       cv.fillSmoothCircle(mx, ty, past ? 3 : 2, past ? hot : base);
     }
 
-    // (B) entry hint — rocking device + "tilt to scroll", after the name toast
+    // (B) entry hint — "hold A to pick", after the name toast
     unsigned long te = millis() - g_screen_since;
     float hop = 0.0f;
     if      (te < 1300) hop = 0.0f;
@@ -1236,25 +1234,9 @@ static void drawFeedList(const RfRow* rows, int n, int top, int win) {
     else if (te < 3100) hop = 1.0f - (te - 2700) / 400.0f;
     if (hop > 0.02f) {
       uint16_t hc = lerp565(BG, rgb565(0xF4,0xF4,0xF7), hop * 0.9f);
-      int hx = W / 2, hy = H - 30;
-      float th = sinf(millis() / 150.0f) * 0.22f;        // rock ±~12 deg
-      float co = cosf(th), si = sinf(th);
-      const float pxs[4] = { -11, 11, 11, -11 };
-      const float pys[4] = {  -6, -6,  6,   6 };
-      int rx[4], ry[4];
-      for (int i = 0; i < 4; ++i) {
-        rx[i] = hx + (int)lroundf(pxs[i] * co - pys[i] * si);
-        ry[i] = hy + (int)lroundf(pxs[i] * si + pys[i] * co);
-      }
-      cv.fillTriangle(rx[0], ry[0], rx[1], ry[1], rx[2], ry[2], hc);
-      cv.fillTriangle(rx[0], ry[0], rx[2], ry[2], rx[3], ry[3], hc);
-      uint16_t slit = lerp565(BG, rgb565(0x1C,0x1C,0x24), hop);
-      cv.drawLine(rx[0] + (rx[3]-rx[0]) / 4, ry[0] + (ry[3]-ry[0]) / 4,
-                  rx[1] + (rx[2]-rx[1]) / 4, ry[1] + (ry[2]-ry[1]) / 4, slit);
-      cv.drawLine(hx - 21, hy - 3, hx - 16, hy, hc); cv.drawLine(hx - 21, hy + 3, hx - 16, hy, hc);
-      cv.drawLine(hx + 21, hy - 3, hx + 16, hy, hc); cv.drawLine(hx + 21, hy + 3, hx + 16, hy, hc);
+      int hx = W / 2, hy = H - 18;
       fontSmall(); cv.setTextDatum(middle_center); cv.setTextColor(hc);
-      cv.drawString("tilt to scroll", hx, hy + 17);
+      cv.drawString("hold A to pick", hx, hy);
     }
   }
 
@@ -1267,11 +1249,9 @@ static void drawFeedList(const RfRow* rows, int n, int top, int win) {
     cv.setTextColor(MUTE, PILL_BG); cv.setTextDatum(middle_center);
     cv.drawString(pi, W - 6 - pw / 2, top + 12);
 
-    // DEBUG: tilt readout — e (deviation from captured neutral) and step dir.
-    // At rest e should sit near 0.00; tilting should push |e| past 0.12 and dir to ±1.
-    char dbg[24]; snprintf(dbg, sizeof(dbg), "e%+.2f d%+d", g_dbg_cur_e, g_dbg_cur_dir);
-    fontSmall(); cv.setTextColor(rgb565(0x66,0xCC,0x66), BG); cv.setTextDatum(bottom_left);
-    cv.drawString(dbg, 6, H - 2);
+    // in-pick controls hint
+    fontSmall(); cv.setTextColor(MUTE, BG); cv.setTextDatum(bottom_left);
+    cv.drawString("A next   B pick", 6, H - 2);
   }
 }
 
@@ -1837,10 +1817,13 @@ void loop() {
   // BtnA click: exit cursor / exit locating / exit detail / cycle screens
   if (M5.BtnA.wasClicked()) {
     if (g_cursor_mode && (g_screen == SCR_SCAN || g_screen == SCR_BLE)) {
-      // A is INERT while picking. Rolling the stick to tilt squeezes this front button,
-      // and a click can land at ANY tilt value, so no threshold can safely allow a cancel
-      // here. Leaving A dead in cursor mode is the only reliable fix. To exit without
-      // choosing: B-hold. To choose: level the device, then click B.
+      // A-click advances the highlight to the next entry (wraps). Hold the device still
+      // and tap — no tilt involved. An accidental tap just steps one (harmless, recoverable).
+      if (g_dispN > 0) {
+        g_scan_sel = (g_scan_sel + 1) % g_dispN;
+        strncpy(g_cursor_mac, g_disp[g_scan_sel].mac, 17); g_cursor_mac[17] = '\0';
+        g_cursor_idle_ms = millis();
+      }
     }
     else if (g_locating)      { g_locating = false; }
     else if (g_portal_active) stopConfigPortal();
@@ -1889,9 +1872,8 @@ void loop() {
         // in detail: cycle selection (legacy behaviour)
         if (g_dispN > 0) { g_scan_sel = (g_scan_sel + 1) % g_dispN; g_detail_row = g_disp[g_scan_sel]; }
       } else if (g_cursor_mode) {
-        // cursor active: B click selects the highlighted entry — only when the device is back
-        // near your hold position (|tilt|<0.08), so an accidental squeeze mid-tilt can't fire it.
-        if (fabsf(g_dbg_cur_e) < 0.08f && g_dispN > 0 && g_scan_sel >= 0 && g_scan_sel < g_dispN) {
+        // cursor active: B click selects the highlighted entry.
+        if (g_dispN > 0 && g_scan_sel >= 0 && g_scan_sel < g_dispN) {
           RfRow& sel = g_disp[g_scan_sel];
           if (sel.src == drone::SRC_BLE) {
             // BLE entry → enter locator mode directly
@@ -2060,66 +2042,19 @@ void loop() {
     if (fabsf(mag - last_mag) > 0.06f) g_last_motion = now;
     last_mag = mag;
 
-    // ---- tilt-shuttle: roll axis sets feed scroll velocity ----
+    // ---- live-feed scroll: AUTO-TICKER only. Tilt no longer scrolls the list — it is
+    //      reserved for cursor stepping in pick mode (A-hold). Browsing is hands-still,
+    //      which also means far fewer accidental button squeezes while you read.
     {
-      const float TILT_SIGN = 1.0f;     // set -1 if forward tilt scrolls the wrong way
-      const float TILT_DEAD = 0.11f;    // narrower neutral band (~6 deg) — reacts to smaller tilt
-      const float TILT_SENS = 850.0f;   // px/s per g past the deadzone — more scroll per degree
-      float tilt = TILT_SIGN * gx;      // LEFT-RIGHT (roll) axis = gx; if it does nothing, try gy or gz
-      if (g_tilt_neutral > 90.0f) g_tilt_neutral = tilt;          // first-run seed
-      if ((g_screen == SCR_SCAN || g_screen == SCR_BLE) && !g_detail && !g_paused) {
-        float e = tilt - g_tilt_neutral;
-        g_tilt_e = e;
-        if (e > TILT_DEAD) {                                      // tip forward -> faster down
-          g_feed_vel = TICKER_PXPS + (e - TILT_DEAD) * TILT_SENS; g_tilt_scrub = true; g_tilt_dir = 1;
-        } else if (e < -TILT_DEAD) {                             // tip back -> reverse (up)
-          g_feed_vel = -((-e - TILT_DEAD) * TILT_SENS);          g_tilt_scrub = true; g_tilt_dir = -1;
-        } else {                                                 // neutral -> normal auto ticker
-          g_feed_vel = TICKER_PXPS;                              g_tilt_scrub = false; g_tilt_dir = 0;
-        }
-        if (g_feed_vel >  300.0f) g_feed_vel =  300.0f;
-        if (g_feed_vel < -300.0f) g_feed_vel = -300.0f;
-        // neutral re-center — k scaled for 10 ms to preserve original time constants (~975 ms / ~6.2 s)
-        g_tilt_neutral += (g_tilt_scrub ? 0.0016f : 0.010f) * (tilt - g_tilt_neutral);
-      } else {
-        g_feed_vel = TICKER_PXPS; g_tilt_scrub = false; g_tilt_dir = 0; g_tilt_e = 0.0f;
-      }
+      g_feed_vel   = TICKER_PXPS;   // steady auto-scroll, regardless of tilt
+      g_tilt_scrub = false;
+      g_tilt_dir   = 0;
+      g_tilt_e     = 0.0f;
     }
 
-    // ---- cursor mode: tilt moves the highlight one entry at a time, CONTROLLABLY.
-    //      Uses a FIXED tilt reference captured the moment you enter cursor mode — NOT
-    //      the scroll's adaptive neutral, whose drift was making the cursor wander and
-    //      reverse. Tilt away from your hold position to step (quick tilt = one step;
-    //      HOLD to walk ~4/sec); return to that hold position to stop.
-    {
-      static bool  s_was     = false;
-      static int   s_latch   = 0;     // 0 = armed (ready); ±1 = already stepped, waiting to re-arm
-      static float s_neutral = 0.0f;
-      bool active = g_cursor_mode && (g_screen == SCR_SCAN || g_screen == SCR_BLE) && !g_detail;
-      if (active) {
-        const float STEP_SIGN = 1.0f;   // flip to -1 if up/down come out reversed
-        const float FIRE  = 0.14f;      // tilt past this (g) from your hold reference = ONE step
-        const float REARM = 0.06f;      // return inside this before it will step again
-        if (!s_was) { s_neutral = gx; s_latch = 0; s_was = true; }  // capture fixed reference on entry
-        float e = STEP_SIGN * (gx - s_neutral);                     // stable: does NOT drift
-        g_dbg_cur_e = e; g_dbg_cur_dir = s_latch;                   // DEBUG readout
-        if (fabsf(e) > REARM) g_cursor_idle_ms = millis();          // any active tilt keeps cursor mode alive
-        if (fabsf(e) < REARM) {
-          s_latch = 0;                  // back near the hold position — re-armed for the next step
-        } else if (s_latch == 0 && fabsf(e) >= FIRE && g_dispN > 0) {
-          int d = (e > 0) ? 1 : -1;     // ONE step per tilt — cannot run away
-          g_scan_sel += d;
-          if (g_scan_sel < 0)        g_scan_sel = 0;
-          if (g_scan_sel >= g_dispN) g_scan_sel = g_dispN - 1;
-          strncpy(g_cursor_mac, g_disp[g_scan_sel].mac, 17);
-          g_cursor_mac[17] = '\0';
-          g_cursor_idle_ms = millis();
-          s_latch = d;                  // fired — locked until you return toward neutral
-        }
-      } else {
-        s_was = false;                          // left cursor mode — recapture neutral next entry
-      }
-    }
+    // ---- cursor mode picking is BUTTON-DRIVEN now (no tilt): A-click advances the
+    //      highlight, B-click selects, B-hold exits. See the button handlers above.
+    //      Tilt is no longer involved in selection at all.
   }
 
   static unsigned long last_batt = 0;
@@ -2196,12 +2131,9 @@ void loop() {
 
   if (g_popup_until && now >= g_popup_until) { g_popup_until = 0; render(); }
 
-  // cursor idle timeout: 8 s without a pitch gesture exits cursor mode
-  if (g_cursor_mode && (g_screen == SCR_SCAN || g_screen == SCR_BLE) &&
-      now - g_cursor_idle_ms > 8000UL) {
-    g_cursor_mode = false; g_feed_manual = false;
-    render();
-  }
+  // (Cursor mode has NO idle timeout. It stays active until you select (B) or exit
+  //  (B-hold). The old 8 s auto-exit was silently dumping you to the feed with no button
+  //  press — that was the phantom "tilt kicked me out." Gone now.)
 
   static unsigned long last_idle = 0;
   if (now - last_idle > 1000) { last_idle = now; render(); }
